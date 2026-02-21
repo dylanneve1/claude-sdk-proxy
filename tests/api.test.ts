@@ -211,6 +211,20 @@ describe("Request ID", () => {
   })
 })
 
+// ── Batches stub ─────────────────────────────────────────────────────────────
+
+describe("POST /v1/messages/batches", () => {
+  test("returns 501 Not Implemented", async () => {
+    const { status, body } = await json("/v1/messages/batches", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({})
+    })
+    expect(status).toBe(501)
+    expect(body.error.type).toBe("not_implemented_error")
+  })
+})
+
 // ── 404 ──────────────────────────────────────────────────────────────────────
 
 describe("Unknown routes", () => {

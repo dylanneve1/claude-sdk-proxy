@@ -535,6 +535,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
   app.post("/v1/messages", handleMessages)
   app.post("/messages", handleMessages)
 
+  // Stub: batches API not supported
+  const handleBatches = (c: Context) => c.json({
+    type: "error",
+    error: { type: "not_implemented_error", message: "Batches API is not supported by this proxy" }
+  }, 501)
+  app.post("/v1/messages/batches", handleBatches)
+  app.get("/v1/messages/batches", handleBatches)
+  app.get("/v1/messages/batches/:id", handleBatches)
+
   return { app, config: finalConfig }
 }
 
@@ -548,6 +557,16 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}) {
     idleTimeout: 0
   })
 
-  console.log(`Claude Max Proxy running at http://${finalConfig.host}:${finalConfig.port}`)
+  console.log(`Claude Max Proxy v${PROXY_VERSION} running at http://${finalConfig.host}:${finalConfig.port}`)
+
+  // Graceful shutdown
+  const shutdown = (signal: string) => {
+    console.log(`\nReceived ${signal}, shutting down...`)
+    server.stop(true) // true = wait for in-flight requests
+    process.exit(0)
+  }
+  process.on("SIGINT", () => shutdown("SIGINT"))
+  process.on("SIGTERM", () => shutdown("SIGTERM"))
+
   return server
 }
