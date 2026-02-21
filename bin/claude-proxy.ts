@@ -45,7 +45,7 @@ function getArg(flags: string[]): string | undefined {
 }
 
 if (args.includes("--debug") || args.includes("-d")) {
-  process.env.OPENCODE_CLAUDE_PROVIDER_DEBUG = "1"
+  process.env.CLAUDE_PROXY_DEBUG = "1"
 }
 
 const port = parseInt(getArg(["-p", "--port"]) ?? process.env.CLAUDE_PROXY_PORT ?? "3456", 10)

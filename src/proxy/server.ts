@@ -186,6 +186,7 @@ function buildQueryOptions(
     clientSystemPrompt?: string
     mcpState?: McpServerState
     abortController?: AbortController
+    maxThinkingTokens?: number
   } = {}
 ) {
   const base = {
@@ -197,6 +198,7 @@ function buildQueryOptions(
     settingSources: [],
     ...(opts.partial ? { includePartialMessages: true } : {}),
     ...(opts.abortController ? { abortController: opts.abortController } : {}),
+    ...(opts.maxThinkingTokens ? { maxThinkingTokens: opts.maxThinkingTokens } : {}),
     disallowedTools: [...BLOCKED_BUILTIN_TOOLS],
   }
 
@@ -225,6 +227,25 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
   const app = new Hono()
 
   app.use("*", cors())
+
+  // Optional API key validation — when CLAUDE_PROXY_API_KEY is set,
+  // require a matching x-api-key or Authorization: Bearer header.
+  const requiredApiKey = process.env.CLAUDE_PROXY_API_KEY
+  if (requiredApiKey) {
+    app.use("*", async (c, next) => {
+      // Skip auth for health check and OPTIONS
+      if (c.req.path === "/" || c.req.method === "OPTIONS") return next()
+      const key = c.req.header("x-api-key")
+        ?? c.req.header("authorization")?.replace(/^Bearer\s+/i, "")
+      if (key !== requiredApiKey) {
+        return c.json({
+          type: "error",
+          error: { type: "authentication_error", message: "Invalid API key" }
+        }, 401)
+      }
+      return next()
+    })
+  }
 
   // Anthropic-compatible headers + request logging
   app.use("*", async (c, next) => {
@@ -288,7 +309,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
   const handleMessages = async (c: Context) => {
     const reqId = randomBytes(4).toString("hex")
     try {
-      const body = await c.req.json()
+      let body: any
+      try {
+        body = await c.req.json()
+      } catch {
+        return c.json({ type: "error", error: { type: "invalid_request_error", message: "Request body must be valid JSON" } }, 400)
+      }
 
       if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
         return c.json({ type: "error", error: { type: "invalid_request_error", message: "messages is required and must be a non-empty array" } }, 400)
@@ -301,7 +327,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       const abortController = new AbortController()
       const timeout = setTimeout(() => abortController.abort(), finalConfig.requestTimeoutMs)
 
-      claudeLog("proxy.request", { reqId, model, stream, msgs: body.messages?.length, clientToolMode })
+      // Extended thinking: extract budget_tokens from thinking parameter
+      const maxThinkingTokens = body.thinking?.type === "enabled" ? body.thinking.budget_tokens : undefined
+
+      claudeLog("proxy.request", { reqId, model, stream, msgs: body.messages?.length, clientToolMode, ...(maxThinkingTokens ? { maxThinkingTokens } : {}) })
 
       const tempFiles: string[] = []
 
@@ -344,7 +373,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       if (!stream) {
         let fullText = ""
         try {
-          for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: false, clientToolMode, clientSystemPrompt, mcpState, abortController }) })) {
+          for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: false, clientToolMode, clientSystemPrompt, mcpState, abortController, maxThinkingTokens }) })) {
             if (message.type === "assistant") {
               fullText = ""
               for (const block of message.message.content) {
@@ -417,7 +446,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             if (clientToolMode) {
               let fullText = ""
               try {
-                for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, clientToolMode: true, clientSystemPrompt, abortController }) })) {
+                for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, clientToolMode: true, clientSystemPrompt, abortController, maxThinkingTokens }) })) {
                   if (message.type === "stream_event") {
                     const ev = message.event as any
                     if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
@@ -466,7 +495,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
             let fullText = ""
             try {
-              for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, mcpState, abortController }) })) {
+              for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, mcpState, abortController, maxThinkingTokens }) })) {
                 if (message.type === "stream_event") {
                   const ev = message.event as any
                   if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
@@ -588,8 +617,18 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
   const handleChatCompletions = async (c: Context) => {
     try {
-      const body = await c.req.json()
-      const { system, messages } = openaiToAnthropicMessages(body.messages ?? [])
+      let body: any
+      try {
+        body = await c.req.json()
+      } catch {
+        return c.json({ error: { message: "Request body must be valid JSON", type: "invalid_request_error" } }, 400)
+      }
+
+      if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
+        return c.json({ error: { message: "messages is required and must be a non-empty array", type: "invalid_request_error" } }, 400)
+      }
+
+      const { system, messages } = openaiToAnthropicMessages(body.messages)
       const stream = body.stream ?? false
       const requestedModel = body.model ?? "claude-sonnet-4-6"
 
