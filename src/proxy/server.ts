@@ -33,14 +33,15 @@ const ALLOWED_MCP_TOOLS = [
   `mcp__${MCP_SERVER_NAME}__message`,
 ]
 
-// Injected after the system prompt. Bridges openclaw's "message" tool
-// description to the actual MCP tool name, and clarifies file paths.
+// Injected after the system prompt in agent mode. Bridges openclaw's "message"
+// tool to the actual MCP name and suppresses tool-use narration in responses.
 const SEND_MESSAGE_NOTE = `
 ## Tool note (proxy context)
 The \`message\` tool described in your system prompt is available as \`mcp__opencode__message\`.
 - Use it exactly as described: action=send, with \`to\` (chat ID from conversation_label), \`message\` (text), and/or \`filePath\` (absolute path like /tmp/file.png).
 - Always write files to /tmp/ before sending — use bash or write tool with an absolute /tmp/ path.
-- After all message tool calls, output ONLY: NO_REPLY`
+- After all message tool calls, output ONLY: NO_REPLY
+- IMPORTANT: Do NOT narrate or describe your use of internal tools (read, write, bash, mcp__opencode__*) in your responses. Use tools silently and output only the final result.`
 
 function resolveClaudeExecutable(): string {
   try {
@@ -271,6 +272,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
     const reqId = randomBytes(4).toString("hex")
     try {
       const body = await c.req.json()
+
+      // Basic request validation
+      if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
+        return c.json({ type: "error", error: { type: "invalid_request_error", message: "messages is required and must be a non-empty array" } }, 400)
+      }
+
       const model = mapModelToClaudeModel(body.model || "sonnet")
       const stream = body.stream ?? true
       const clientToolMode = isClientToolMode(body)
@@ -310,10 +317,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
       // ── Non-streaming ──────────────────────────────────────────────────────
       if (!stream) {
+        // Reset on each assistant turn so we only return the FINAL turn's text.
+        // This prevents intermediate tool-use narration ("I'll read the file…")
+        // from leaking into the response when the agent does multi-turn work.
         let fullText = ""
         try {
           for await (const message of query({ prompt, options: buildQueryOptions(model, false, clientToolMode) })) {
             if (message.type === "assistant") {
+              fullText = ""   // discard previous turn — keep only the last
               for (const block of message.message.content) {
                 if (block.type === "text") fullText += block.text
               }
