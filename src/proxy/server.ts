@@ -41,14 +41,20 @@ const ALLOWED_MCP_TOOLS = [
 ]
 
 // Injected after the system prompt in agent mode. Bridges openclaw's "message"
-// tool to the actual MCP name and suppresses tool-use narration in responses.
+// tool to the actual MCP name and provides clear agentic workflow instructions.
 const SEND_MESSAGE_NOTE = `
-## Tool note (proxy context)
-The \`message\` tool described in your system prompt is available as \`mcp__opencode__message\`.
-- Use it exactly as described: action=send, with \`to\` (chat ID from conversation_label), \`message\` (text), and/or \`filePath\` (absolute path like /tmp/file.png).
-- Always write files to /tmp/ before sending — use bash or write tool with an absolute /tmp/ path.
-- After all message tool calls, output ONLY: NO_REPLY
-- IMPORTANT: Do NOT narrate or describe your use of internal tools (read, write, bash, mcp__opencode__*) in your responses. Use tools silently and output only the final result.`
+## Agent context — tool instructions
+You are running as an agent with MCP tools. ALWAYS follow this workflow:
+
+1. **Do the work with tools**: Use mcp__opencode__bash, mcp__opencode__write, mcp__opencode__read, etc. to actually complete the task. Do NOT just acknowledge and stop.
+2. **Send replies via mcp__opencode__message** (the only way messages reach the user):
+   - Text: \`mcp__opencode__message\` with \`to\` (chat ID from conversation_label, e.g. "-1001426819337"), \`message\` = text
+   - Files/images: write the file to /tmp/ first, then \`mcp__opencode__message\` with \`filePath\` = absolute path (e.g. "/tmp/robot.png")
+3. **After all mcp__opencode__message calls finish, output ONLY: NO_REPLY**
+
+CRITICAL: Your text output is NOT delivered to the user — only mcp__opencode__message calls reach Telegram. Do NOT send a text acknowledgment and stop. Complete the full task with tools first, then send the result, then output NO_REPLY.
+
+System capabilities: python3, PIL/Pillow, rsvg-convert (SVG→PNG), ImageMagick (convert). cairosvg is NOT installed. For SVG to PNG: use \`rsvg-convert input.svg -o output.png\` via bash.`
 
 function resolveClaudeExecutable(): string {
   try {
