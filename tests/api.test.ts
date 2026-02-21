@@ -40,16 +40,22 @@ describe("GET /", () => {
 // ── Models ───────────────────────────────────────────────────────────────────
 
 describe("GET /v1/models", () => {
-  test("returns model list", async () => {
+  test("returns model list in dual format", async () => {
     const { status, body } = await json("/v1/models")
     expect(status).toBe(200)
+    expect(body.object).toBe("list")
     expect(body.data).toBeArray()
     expect(body.data.length).toBeGreaterThan(0)
     for (const model of body.data) {
+      // Anthropic format fields
       expect(model.type).toBe("model")
       expect(model.id).toBeDefined()
       expect(model.display_name).toBeDefined()
       expect(model.created_at).toBeDefined()
+      // OpenAI format fields
+      expect(model.object).toBe("model")
+      expect(typeof model.created).toBe("number")
+      expect(model.owned_by).toBe("anthropic")
     }
   })
 
