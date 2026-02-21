@@ -41,20 +41,10 @@ const ALLOWED_MCP_TOOLS = [
 ]
 
 // Injected after the system prompt in agent mode. Bridges openclaw's "message"
-// tool to the actual MCP name and provides clear agentic workflow instructions.
+// tool to the actual MCP name and enforces the correct agentic workflow.
 const SEND_MESSAGE_NOTE = `
-## Agent context — tool instructions
-You are running as an agent with MCP tools. ALWAYS follow this workflow:
-
-1. **Do the work with tools**: Use mcp__opencode__bash, mcp__opencode__write, mcp__opencode__read, etc. to actually complete the task. Do NOT just acknowledge and stop.
-2. **Send replies via mcp__opencode__message** (the only way messages reach the user):
-   - Text: \`mcp__opencode__message\` with \`to\` (chat ID from conversation_label, e.g. "-1001426819337"), \`message\` = text
-   - Files/images: write the file to /tmp/ first, then \`mcp__opencode__message\` with \`filePath\` = absolute path (e.g. "/tmp/robot.png")
-3. **After all mcp__opencode__message calls finish, output ONLY: NO_REPLY**
-
-CRITICAL: Your text output is NOT delivered to the user — only mcp__opencode__message calls reach Telegram. Do NOT send a text acknowledgment and stop. Complete the full task with tools first, then send the result, then output NO_REPLY.
-
-System capabilities: python3, PIL/Pillow, rsvg-convert (SVG→PNG), ImageMagick (convert). cairosvg is NOT installed. For SVG to PNG: use \`rsvg-convert input.svg -o output.png\` via bash.`
+## Tool note (proxy context)
+The \`message\` tool is available as \`mcp__opencode__message\`. Your text output does NOT reach the user — only \`mcp__opencode__message\` calls deliver messages. Always complete the full task with tools, send the result via \`mcp__opencode__message\`, then output ONLY: NO_REPLY`
 
 function resolveClaudeExecutable(): string {
   try {
