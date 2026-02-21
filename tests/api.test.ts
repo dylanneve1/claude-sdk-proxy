@@ -225,6 +225,108 @@ describe("POST /v1/messages/batches", () => {
   })
 })
 
+// ── Malformed JSON ──────────────────────────────────────────────────────────
+
+describe("POST /v1/messages (malformed JSON)", () => {
+  test("400 for invalid JSON body", async () => {
+    const res = await req("/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "not json at all {"
+    })
+    const body = await res.json() as any
+    expect(res.status).toBe(400)
+    expect(body.error.type).toBe("invalid_request_error")
+    expect(body.error.message).toContain("valid JSON")
+  })
+})
+
+describe("POST /v1/chat/completions (malformed JSON)", () => {
+  test("400 for invalid JSON body", async () => {
+    const res = await req("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{broken"
+    })
+    const body = await res.json() as any
+    expect(res.status).toBe(400)
+    expect(body.error.type).toBe("invalid_request_error")
+  })
+
+  test("400 for empty messages", async () => {
+    const { status, body } = await json("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "claude-sonnet-4-6", messages: [] })
+    })
+    expect(status).toBe(400)
+    expect(body.error.type).toBe("invalid_request_error")
+  })
+})
+
+// ── API key validation ──────────────────────────────────────────────────────
+
+describe("API key validation", () => {
+  test("when CLAUDE_PROXY_API_KEY is set, unauthenticated requests to protected endpoints are rejected", async () => {
+    // Create a separate server instance with API key set
+    const originalKey = process.env.CLAUDE_PROXY_API_KEY
+    process.env.CLAUDE_PROXY_API_KEY = "test-secret-key"
+    try {
+      const { app: authedApp } = createProxyServer({ port: 0, host: "127.0.0.1" })
+      const res = await authedApp.fetch(new Request("http://localhost/v1/models"))
+      const body = await res.json() as any
+      expect(res.status).toBe(401)
+      expect(body.error.type).toBe("authentication_error")
+    } finally {
+      if (originalKey) process.env.CLAUDE_PROXY_API_KEY = originalKey
+      else delete process.env.CLAUDE_PROXY_API_KEY
+    }
+  })
+
+  test("health endpoint bypasses auth", async () => {
+    const originalKey = process.env.CLAUDE_PROXY_API_KEY
+    process.env.CLAUDE_PROXY_API_KEY = "test-secret-key"
+    try {
+      const { app: authedApp } = createProxyServer({ port: 0, host: "127.0.0.1" })
+      const res = await authedApp.fetch(new Request("http://localhost/"))
+      expect(res.status).toBe(200)
+    } finally {
+      if (originalKey) process.env.CLAUDE_PROXY_API_KEY = originalKey
+      else delete process.env.CLAUDE_PROXY_API_KEY
+    }
+  })
+
+  test("valid x-api-key header passes auth", async () => {
+    const originalKey = process.env.CLAUDE_PROXY_API_KEY
+    process.env.CLAUDE_PROXY_API_KEY = "test-secret-key"
+    try {
+      const { app: authedApp } = createProxyServer({ port: 0, host: "127.0.0.1" })
+      const res = await authedApp.fetch(new Request("http://localhost/v1/models", {
+        headers: { "x-api-key": "test-secret-key" }
+      }))
+      expect(res.status).toBe(200)
+    } finally {
+      if (originalKey) process.env.CLAUDE_PROXY_API_KEY = originalKey
+      else delete process.env.CLAUDE_PROXY_API_KEY
+    }
+  })
+
+  test("valid Authorization Bearer header passes auth", async () => {
+    const originalKey = process.env.CLAUDE_PROXY_API_KEY
+    process.env.CLAUDE_PROXY_API_KEY = "test-secret-key"
+    try {
+      const { app: authedApp } = createProxyServer({ port: 0, host: "127.0.0.1" })
+      const res = await authedApp.fetch(new Request("http://localhost/v1/models", {
+        headers: { "Authorization": "Bearer test-secret-key" }
+      }))
+      expect(res.status).toBe(200)
+    } finally {
+      if (originalKey) process.env.CLAUDE_PROXY_API_KEY = originalKey
+      else delete process.env.CLAUDE_PROXY_API_KEY
+    }
+  })
+})
+
 // ── 404 ──────────────────────────────────────────────────────────────────────
 
 describe("Unknown routes", () => {

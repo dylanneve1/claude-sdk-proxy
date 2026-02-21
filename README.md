@@ -2,43 +2,24 @@
 
 A drop-in Anthropic Messages API proxy backed by the **Claude Agent SDK**. Use your Claude Max subscription with any Anthropic API client — zero API cost.
 
+Also supports **OpenAI-compatible** endpoints so tools like LangChain, LiteLLM, and the OpenAI SDK work out of the box.
+
 ```
-Any Anthropic client → claude-proxy (:3456) → Claude Agent SDK → Claude Max
+Any Anthropic/OpenAI client → claude-proxy (:3456) → Claude Agent SDK → Claude Max
 ```
 
 ## Features
 
 - **Drop-in replacement** — set `ANTHROPIC_BASE_URL=http://127.0.0.1:3456` and go
+- **OpenAI compatibility** — `/v1/chat/completions` with streaming + non-streaming
 - **Zero cost** — routes through your Claude Max subscription via the Agent SDK
 - **Full tool use** — proper `tool_use` content blocks, `stop_reason: "tool_use"`, `input_json_delta` streaming
 - **Built-in agent tools** — Claude has access to Read, Write, Edit, Bash, Glob, Grep, WebFetch, WebSearch
-- **`/v1/models` + `/v1/models/:id`** — model listing and lookup
-- **`/v1/messages/count_tokens`** — rough token estimates
+- **API key protection** — optional `CLAUDE_PROXY_API_KEY` to secure network-exposed instances
 - **Streaming SSE** — `message_start` emitted immediately; 15s heartbeat keeps connections alive
-- **Inbound images** — base64 image blocks saved to temp files for Claude to read
-- **Tool result truncation** — 4000 char cap prevents context explosion
-- **Per-request isolation** — fresh MCP server per request, no shared state
-
-## Architecture
-
-### Agent mode (no caller tools)
-```
-POST /v1/messages
-  → Serialize messages → prompt
-  → Claude Agent SDK query() (maxTurns=50)
-       ├─ Built-in tools: Read, Write, Edit, Bash, Glob, Grep, ...
-       └─ MCP tools: message (optional gateway delivery)
-```
-
-### Client tool mode (caller provides tools)
-```
-POST /v1/messages  with  "tools": [...]
-  → Inject tool definitions into prompt (all built-in tools disabled)
-  → Claude Agent SDK query() (maxTurns=1)
-       → Parse <tool_use> blocks → emit tool_use content blocks
-```
-
-Client tool mode is auto-detected when the request has a `tools` array and the system prompt doesn't contain agent session markers.
+- **Request timeout** — configurable per-request timeout (default 5 minutes)
+- **Graceful shutdown** — SIGINT/SIGTERM handlers wait for in-flight requests
+- **Docker ready** — Dockerfile and docker-compose.yml included
 
 ## Quick Start
 
@@ -69,18 +50,167 @@ bun run proxy
 # Proxy listening at http://127.0.0.1:3456
 ```
 
-### Usage
+### Docker
 
 ```bash
-# Any Anthropic SDK
-ANTHROPIC_BASE_URL=http://127.0.0.1:3456 ANTHROPIC_API_KEY=dummy your-app
-
-# Python
-import anthropic
-client = anthropic.Anthropic(base_url="http://127.0.0.1:3456", api_key="dummy")
+docker compose up -d
+# or
+docker build -t claude-proxy . && docker run -p 3456:3456 -v ~/.claude:/root/.claude:ro claude-proxy
 ```
 
-### systemd (Linux auto-start)
+## Usage Examples
+
+### Anthropic SDK (Python)
+
+```python
+import anthropic
+
+client = anthropic.Anthropic(
+    base_url="http://127.0.0.1:3456",
+    api_key="dummy"  # any value works unless CLAUDE_PROXY_API_KEY is set
+)
+
+response = client.messages.create(
+    model="claude-sonnet-4-6",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Hello!"}]
+)
+print(response.content[0].text)
+```
+
+### OpenAI SDK (Python)
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:3456/v1/chat",
+    api_key="dummy"
+)
+
+response = client.chat.completions.create(
+    model="claude-sonnet-4-6",
+    messages=[{"role": "user", "content": "Hello!"}]
+)
+print(response.choices[0].message.content)
+```
+
+### curl (Anthropic format)
+
+```bash
+curl http://127.0.0.1:3456/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "stream": false,
+    "messages": [{"role": "user", "content": "What is 2+2?"}]
+  }'
+```
+
+### curl (OpenAI format)
+
+```bash
+curl http://127.0.0.1:3456/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-6",
+    "stream": false,
+    "messages": [{"role": "user", "content": "What is 2+2?"}]
+  }'
+```
+
+### Environment variable approach
+
+```bash
+# Works with any Anthropic SDK client
+ANTHROPIC_BASE_URL=http://127.0.0.1:3456 ANTHROPIC_API_KEY=dummy your-app
+
+# Works with any OpenAI SDK client
+OPENAI_BASE_URL=http://127.0.0.1:3456/v1/chat OPENAI_API_KEY=dummy your-app
+```
+
+## Architecture
+
+### Agent mode (no caller tools)
+```
+POST /v1/messages
+  → Serialize messages → prompt
+  → Claude Agent SDK query() (maxTurns=50)
+       ├─ Built-in tools: Read, Write, Edit, Bash, Glob, Grep, ...
+       └─ MCP tools: message (optional gateway delivery)
+```
+
+### Client tool mode (caller provides tools)
+```
+POST /v1/messages  with  "tools": [...]
+  → Inject tool definitions into system prompt (all built-in tools disabled)
+  → Claude Agent SDK query() (maxTurns=1)
+       → Parse <tool_use> blocks → emit tool_use content blocks
+```
+
+Client tool mode is auto-detected when the request has a `tools` array and the system prompt doesn't contain agent session markers.
+
+## API Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/` | Health check / service info |
+| `GET` | `/v1/models` | List available models (Anthropic format) |
+| `GET` | `/v1/models/:id` | Get model details |
+| `POST` | `/v1/messages` | Create a message (streaming or non-streaming) |
+| `POST` | `/v1/messages/count_tokens` | Estimate token count |
+| `POST` | `/v1/chat/completions` | OpenAI-compatible chat completions |
+| `GET` | `/v1/chat/models` | List models (OpenAI format) |
+
+All Anthropic endpoints are also available without the `/v1` prefix.
+
+## CLI Options
+
+```
+claude-proxy [options]
+
+  -p, --port <port>   Listen port (default: 3456, env: CLAUDE_PROXY_PORT)
+  -H, --host <host>   Bind address (default: 127.0.0.1, env: CLAUDE_PROXY_HOST)
+  -d, --debug         Enable debug logging
+  -v, --version       Show version
+  -h, --help          Show help
+```
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLAUDE_PROXY_PORT` | `3456` | Proxy listen port |
+| `CLAUDE_PROXY_HOST` | `127.0.0.1` | Proxy bind address |
+| `CLAUDE_PROXY_DEBUG` | unset | Enable debug logging (`1` to enable) |
+| `CLAUDE_PROXY_API_KEY` | unset | When set, require this key via `x-api-key` or `Authorization: Bearer` header |
+| `CLAUDE_PROXY_TIMEOUT_MS` | `300000` | Per-request timeout in milliseconds |
+
+## Testing
+
+```bash
+# Unit tests (no running proxy needed)
+bun test
+
+# Integration tests (requires running proxy + Claude CLI auth)
+bun run test:integration
+
+# All tests
+bun run test:all
+
+# Type checking
+bun run typecheck
+```
+
+## Model Mapping
+
+| Request model string | Claude SDK tier |
+|---------------------|-----------------|
+| `*opus*` | opus |
+| `*haiku*` | haiku |
+| anything else | sonnet |
+
+## systemd (Linux auto-start)
 
 ```ini
 [Unit]
@@ -98,58 +228,6 @@ Environment=CLAUDE_PROXY_PORT=3456
 [Install]
 WantedBy=default.target
 ```
-
-## Testing
-
-```bash
-# Unit tests (no running proxy needed)
-bun test
-
-# Integration tests (requires running proxy + Claude CLI auth)
-bun run test:integration
-
-# All tests
-bun run test:all
-```
-
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CLAUDE_PROXY_PORT` | `3456` | Proxy listen port |
-| `CLAUDE_PROXY_HOST` | `127.0.0.1` | Proxy bind address |
-| `OPENCODE_CLAUDE_PROVIDER_DEBUG` | unset | Enable debug logging |
-
-## Model Mapping
-
-| Request model string | Claude SDK tier |
-|---------------------|-----------------|
-| `*opus*` | opus |
-| `*haiku*` | haiku |
-| anything else | sonnet |
-
-## API Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/` | Health check / service info |
-| `GET` | `/v1/models` | List available models |
-| `GET` | `/v1/models/:id` | Get model details |
-| `POST` | `/v1/messages` | Create a message (streaming or non-streaming) |
-| `POST` | `/v1/messages/count_tokens` | Estimate token count |
-
-All endpoints are also available without the `/v1` prefix.
-
-## MCP Message Tool (optional)
-
-The proxy includes an optional `message` MCP tool (`mcp__opencode__message`) for gateway-based message delivery. When this tool delivers a message, the proxy automatically suppresses its text response to prevent double-delivery — no special sentinel values needed from Claude.
-
-| Param | Required | Description |
-|-------|----------|-------------|
-| `to` | yes | Chat ID |
-| `message` | one of | Text to send |
-| `filePath` / `path` / `media` | one of | Path to file — converted to `file://` URL |
-| `caption` | | Caption for media |
 
 ## License
 

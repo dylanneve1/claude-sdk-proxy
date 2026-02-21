@@ -13,9 +13,9 @@
   "scripts": {
     "start": "bun run ./bin/claude-proxy.ts",
     "proxy": "bun run ./bin/claude-proxy.ts",
-    "test": "bun test tests/helpers.test.ts tests/api.test.ts",
-    "test:integration": "INTEGRATION=1 bun test tests/integration.test.ts",
-    "test:all": "bun test tests/helpers.test.ts tests/api.test.ts && INTEGRATION=1 bun test tests/integration.test.ts",
+    "test": "bun test tests/helpers.test.ts tests/api.test.ts tests/openai-compat.test.ts",
+    "test:integration": "INTEGRATION=1 bun test tests/integration.test.ts tests/openai-compat.test.ts",
+    "test:all": "bun test tests/helpers.test.ts tests/api.test.ts tests/openai-compat.test.ts && INTEGRATION=1 bun test tests/integration.test.ts tests/openai-compat.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "engines": {

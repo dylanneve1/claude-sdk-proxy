@@ -1,0 +1,16 @@
+services:
+  claude-proxy:
+    build: .
+    ports:
+      - "3456:3456"
+    environment:
+      - CLAUDE_PROXY_PORT=3456
+      - CLAUDE_PROXY_HOST=0.0.0.0
+      # Optional: set an API key to secure the proxy
+      # - CLAUDE_PROXY_API_KEY=your-secret-key
+      # Optional: enable debug logging
+      # - CLAUDE_PROXY_DEBUG=1
+    volumes:
+      # Mount Claude CLI credentials from host
+      - ${HOME}/.claude:/root/.claude:ro
+    restart: unless-stopped
