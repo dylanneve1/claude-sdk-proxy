@@ -1,16 +1,8 @@
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk"
 import { z } from "zod"
-import * as fs from "node:fs/promises"
-import * as path from "node:path"
-import { exec } from "node:child_process"
-import { promisify } from "node:util"
-import { glob as globLib } from "glob"
 import { createPrivateKey, createPublicKey, sign, randomBytes } from "node:crypto"
 import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
-
-const execAsync = promisify(exec)
-const getCwd = () => process.cwd()
 
 // ── Gateway helpers ──────────────────────────────────────────────────────────
 
@@ -29,7 +21,6 @@ function pubKeyRawB64url(publicKeyPem: string): string {
   return b64urlEncode(der.slice(12)) // strip 12-byte ED25519 SPKI prefix
 }
 
-// Cache identity + gateway token — read once, invalidate on error
 let _identity: { deviceId: string; privateKeyPem: string; publicKeyPem: string } | null = null
 let _gatewayToken: string | null = null
 
@@ -50,11 +41,6 @@ function invalidateGatewayConfig() {
   _gatewayToken = null
 }
 
-/**
- * Send a message (text and/or media) to a Telegram chat via the openclaw gateway WebSocket.
- * Uses Ed25519 device identity with operator.admin scope (bypasses all method
- * scope checks server-side). Opens a fresh WS connection per call.
- */
 async function sendViaGateway(
   to: string,
   message?: string,
@@ -100,8 +86,6 @@ async function sendViaGateway(
           const nonce: string = frame.payload.nonce
           const signedAtMs = Date.now()
           const SCOPES = ["operator.admin"]
-          // Build the auth payload that gets signed with the device Ed25519 key.
-          // Format: v2|deviceId|clientId|clientMode|role|scopes|signedAtMs|token|nonce
           const authPayload = ["v2", identity!.deviceId, "cli", "cli", "operator",
             SCOPES.join(","), String(signedAtMs), token, nonce].join("|")
           ws.send(JSON.stringify({
@@ -124,7 +108,6 @@ async function sendViaGateway(
 
         } else if (!connected && frame.type === "res" && frame.id === "conn1") {
           if (!frame.ok) {
-            // If connect fails with auth error, invalidate cached creds
             if (frame.error?.message?.includes("unauthorized") ||
                 frame.error?.message?.includes("pairing")) {
               invalidateGatewayConfig()
@@ -160,12 +143,12 @@ async function sendViaGateway(
 }
 
 // ── MCP server factory ───────────────────────────────────────────────────────
-// Returns a fresh MCP server instance. Called per-request to avoid concurrency
-// issues when multiple simultaneous queries share the same server object.
+// Provides only the gateway message tool. File operations, bash, etc. use
+// Claude Code's built-in tools (which are more robust and don't need MCP).
 //
-// state.messageSent is set to true when a message is successfully delivered.
-// The proxy uses this to automatically suppress its own text response so
-// openclaw doesn't double-deliver — no NO_REPLY sentinel needed from Claude.
+// state.messageSent is set on successful delivery. The proxy uses this to
+// auto-suppress text responses when messages were sent via tool (prevents
+// double-delivery without requiring Claude to know about any sentinel value).
 
 export interface McpServerState { messageSent: boolean }
 
@@ -174,179 +157,26 @@ export function createMcpServer(state: McpServerState = { messageSent: false }) 
     name: "opencode",
     version: "1.0.0",
     tools: [
-
-      tool(
-        "read",
-        "Read the contents of a file at the specified path",
-        {
-          path: z.string().describe("Absolute or relative path to the file"),
-          encoding: z.string().optional().describe("File encoding, defaults to utf-8")
-        },
-        async (args) => {
-          try {
-            const filePath = path.isAbsolute(args.path)
-              ? args.path
-              : path.resolve(getCwd(), args.path)
-            const content = await fs.readFile(filePath, (args.encoding || "utf-8") as BufferEncoding)
-            return { content: [{ type: "text", text: content }] }
-          } catch (error) {
-            return {
-              content: [{ type: "text", text: `Error reading file: ${error instanceof Error ? error.message : String(error)}` }],
-              isError: true
-            }
-          }
-        }
-      ),
-
-      tool(
-        "write",
-        "Write content to a file, creating directories if needed",
-        {
-          path: z.string().describe("Path to write to"),
-          content: z.string().describe("Content to write")
-        },
-        async (args) => {
-          try {
-            const filePath = path.isAbsolute(args.path)
-              ? args.path
-              : path.resolve(getCwd(), args.path)
-            await fs.mkdir(path.dirname(filePath), { recursive: true })
-            await fs.writeFile(filePath, args.content, "utf-8")
-            return { content: [{ type: "text", text: `Successfully wrote to ${filePath}` }] }
-          } catch (error) {
-            return {
-              content: [{ type: "text", text: `Error writing file: ${error instanceof Error ? error.message : String(error)}` }],
-              isError: true
-            }
-          }
-        }
-      ),
-
-      tool(
-        "edit",
-        "Edit a file by replacing oldString with newString",
-        {
-          path: z.string().describe("Path to the file to edit"),
-          oldString: z.string().describe("The text to replace"),
-          newString: z.string().describe("The replacement text")
-        },
-        async (args) => {
-          try {
-            const filePath = path.isAbsolute(args.path)
-              ? args.path
-              : path.resolve(getCwd(), args.path)
-            const content = await fs.readFile(filePath, "utf-8")
-            if (!content.includes(args.oldString)) {
-              return { content: [{ type: "text", text: "Error: oldString not found in file" }], isError: true }
-            }
-            await fs.writeFile(filePath, content.replace(args.oldString, args.newString), "utf-8")
-            return { content: [{ type: "text", text: `Successfully edited ${args.path}` }] }
-          } catch (error) {
-            return {
-              content: [{ type: "text", text: `Error editing file: ${error instanceof Error ? error.message : String(error)}` }],
-              isError: true
-            }
-          }
-        }
-      ),
-
-      tool(
-        "bash",
-        "Execute a bash command and return the output",
-        {
-          command: z.string().describe("The command to execute"),
-          cwd: z.string().optional().describe("Working directory for the command")
-        },
-        async (args) => {
-          try {
-            const { stdout, stderr } = await execAsync(args.command, {
-              cwd: args.cwd || getCwd(),
-              timeout: 120_000
-            })
-            return { content: [{ type: "text", text: stdout || stderr || "(no output)" }] }
-          } catch (error: unknown) {
-            const e = error as { stdout?: string; stderr?: string; message?: string }
-            return {
-              content: [{ type: "text", text: e.stdout || e.stderr || e.message || String(error) }],
-              isError: true
-            }
-          }
-        }
-      ),
-
-      tool(
-        "glob",
-        "Find files matching a glob pattern",
-        {
-          pattern: z.string().describe("Glob pattern like **/*.ts"),
-          cwd: z.string().optional().describe("Base directory for the search")
-        },
-        async (args) => {
-          try {
-            const files = await globLib(args.pattern, {
-              cwd: args.cwd || getCwd(),
-              nodir: true,
-              ignore: ["**/node_modules/**", "**/.git/**"]
-            })
-            return { content: [{ type: "text", text: files.join("\n") || "(no matches)" }] }
-          } catch (error) {
-            return {
-              content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : String(error)}` }],
-              isError: true
-            }
-          }
-        }
-      ),
-
-      tool(
-        "grep",
-        "Search for a pattern in files",
-        {
-          pattern: z.string().describe("Regex pattern to search for"),
-          path: z.string().optional().describe("Directory or file to search in"),
-          include: z.string().optional().describe("File pattern to include, e.g., *.ts")
-        },
-        async (args) => {
-          try {
-            const searchPath = args.path || getCwd()
-            const includePattern = args.include || "*"
-            const cmd = `grep -rn --include="${includePattern}" "${args.pattern}" "${searchPath}" 2>/dev/null || true`
-            const { stdout } = await execAsync(cmd, { maxBuffer: 10 * 1024 * 1024 })
-            return { content: [{ type: "text", text: stdout || "(no matches)" }] }
-          } catch (error) {
-            return {
-              content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : String(error)}` }],
-              isError: true
-            }
-          }
-        }
-      ),
-
       tool(
         "message",
-        "Send a Telegram message or file via the openclaw gateway. Use action=send (default). Provide `to` (chat ID from conversation_label, e.g. '-1001426819337'), and either `message` (text) or `filePath`/`path`/`media` (absolute path to file in /tmp/, e.g. '/tmp/image.png'). Always write files to /tmp/ first.",
+        "Send a message or file to a chat. Provide `to` (chat ID from conversation_label, e.g. '-1001426819337'), and either `message` (text) or `filePath`/`path`/`media` (absolute path to a file). Write files to /tmp/ before sending.",
         {
-          action: z.string().optional().describe("Action to perform. Use 'send' (default)."),
-          to: z.string().describe(
-            "Telegram chat ID. Extract from conversation_label: e.g. 'chat id:-1001426819337' → '-1001426819337'."
-          ),
+          action: z.string().optional().describe("Action to perform. Default: 'send'."),
+          to: z.string().describe("Chat ID, extracted from conversation_label."),
           message: z.string().optional().describe("Text message to send."),
-          filePath: z.string().optional().describe("Absolute path to a file in /tmp/ to send as attachment, e.g. '/tmp/image.png'."),
+          filePath: z.string().optional().describe("Absolute path to a file to send as attachment."),
           path: z.string().optional().describe("Alias for filePath."),
-          media: z.string().optional().describe("Alias for filePath — file path or URL to send as media attachment."),
-          caption: z.string().optional().describe("Caption text to accompany a media attachment."),
+          media: z.string().optional().describe("Alias for filePath."),
+          caption: z.string().optional().describe("Caption for a media attachment."),
         },
         async (args) => {
           try {
-            // Resolve media path from whichever alias Claude provides
             const rawMedia = args.media ?? args.path ?? args.filePath
-            // Normalize to a file:// URL if it's a plain path (gateway requires this for local files)
             let mediaUrl: string | undefined
             if (rawMedia) {
               if (rawMedia.startsWith("http://") || rawMedia.startsWith("https://") || rawMedia.startsWith("file://")) {
                 mediaUrl = rawMedia
               } else {
-                // Plain absolute path → file:// URL
                 const absPath = rawMedia.startsWith("/") ? rawMedia : `/tmp/${rawMedia}`
                 mediaUrl = `file://${absPath}`
               }
@@ -372,7 +202,6 @@ export function createMcpServer(state: McpServerState = { messageSent: false }) 
           }
         }
       )
-
     ]
   })
 }

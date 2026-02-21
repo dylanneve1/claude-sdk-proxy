@@ -20,30 +20,11 @@ const PROXY_VERSION: string = (() => {
   } catch { return "unknown" }
 })()
 
-// Built-in Claude Code tools to block. "Read" is intentionally kept so Claude
-// can open image temp-files saved from inbound media blocks.
-const BLOCKED_BUILTIN_TOOLS = [
-  "Write", "Edit", "MultiEdit",
-  "Bash", "Glob", "Grep", "NotebookEdit",
-  "WebFetch", "WebSearch", "TodoWrite"
-]
+// Only block tools that add noise — everything else (Read, Write, Edit, Bash,
+// Glob, Grep, WebFetch, WebSearch) uses Claude Code's robust built-in implementations.
+const BLOCKED_BUILTIN_TOOLS = ["TodoWrite", "NotebookEdit"]
 
 const MCP_SERVER_NAME = "opencode"
-
-const ALLOWED_MCP_TOOLS = [
-  `mcp__${MCP_SERVER_NAME}__read`,
-  `mcp__${MCP_SERVER_NAME}__write`,
-  `mcp__${MCP_SERVER_NAME}__edit`,
-  `mcp__${MCP_SERVER_NAME}__bash`,
-  `mcp__${MCP_SERVER_NAME}__glob`,
-  `mcp__${MCP_SERVER_NAME}__grep`,
-  `mcp__${MCP_SERVER_NAME}__message`,
-]
-
-// Injected after the system prompt in agent mode. Only bridges the tool name —
-// the proxy auto-suppresses the text response when the message tool is used,
-// so Claude never needs to know about NO_REPLY.
-const SEND_MESSAGE_NOTE = `\nThe \`message\` tool is available as \`mcp__opencode__message\`.`
 
 function resolveClaudeExecutable(): string {
   try {
@@ -74,11 +55,9 @@ function saveImageToTemp(block: any, tempFiles: string[]): string | null {
     let mediaType = "image/jpeg"
 
     if (typeof block.data === "string") {
-      // openclaw format: { type: "image", data: "<base64>", media_type?: "…" }
       data = block.data
       mediaType = block.media_type || mediaType
     } else if (block.source) {
-      // Anthropic API format: { type: "image", source: { type: "base64", data, media_type } }
       if (block.source.type === "base64" && block.source.data) {
         data = block.source.data
         mediaType = block.source.media_type || mediaType
@@ -90,7 +69,7 @@ function saveImageToTemp(block: any, tempFiles: string[]): string | null {
     if (!data) return null
 
     const ext = mediaType.split("/")[1]?.replace("jpeg", "jpg") || "jpg"
-    const tmpPath = join(tmpdir(), `openclaw-img-${randomBytes(8).toString("hex")}.${ext}`)
+    const tmpPath = join(tmpdir(), `proxy-img-${randomBytes(8).toString("hex")}.${ext}`)
     writeFileSync(tmpPath, Buffer.from(data, "base64"))
     tempFiles.push(tmpPath)
     return tmpPath
@@ -110,7 +89,6 @@ function serializeBlock(block: any, tempFiles: string[]): string {
     case "tool_use":
       return `[Tool call: ${block.name}\nInput: ${JSON.stringify(block.input ?? {}, null, 2)}]`
     case "tool_result": {
-      // Truncate large tool results — cap at 4000 chars to prevent context explosion.
       const content = Array.isArray(block.content)
         ? block.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("")
         : String(block.content ?? "")
@@ -138,38 +116,21 @@ function cleanupTempFiles(tempFiles: string[]) {
   }
 }
 
-// ── Response normalization ───────────────────────────────────────────────────
-
-// If the agent used the message tool it may output verbose text before NO_REPLY.
-// openclaw's isSilentReplyText handles "ends with NO_REPLY", but we normalize to
-// just "NO_REPLY" for a clean session history.
-// If the agent produced no text (maxTurns exhausted or empty run), return "..."
-// so openclaw shows something rather than silence.
-function normalizeResponse(text: string): string {
-  if (!text || !text.trim()) return "..."
-  const trimmed = text.trimEnd()
-  if (trimmed.endsWith("NO_REPLY")) return "NO_REPLY"
-  return text
-}
-
 // ── Client tool-use support ──────────────────────────────────────────────────
 // When the caller provides tool definitions (e.g. Claude Code, LangChain, etc.)
 // we switch to single-turn mode: inject tool defs into the system prompt, run
 // one LLM turn, parse <tool_use> blocks from the output, and return them as
-// proper Anthropic tool_use content blocks.  This lets the caller manage the
-// tool loop themselves, exactly as the real Anthropic API behaves.
+// proper Anthropic tool_use content blocks.
 //
-// We stay in agent mode (multi-turn MCP) when:
-//   • No tools in the request, OR
-//   • The system prompt looks like an openclaw session (which has its own tools)
+// We stay in agent mode (multi-turn, built-in + MCP tools) when:
+//   - No tools in the request, OR
+//   - The request has markers indicating the agent manages its own tool loop
 
 function isClientToolMode(body: any): boolean {
   if (!body.tools?.length) return false
-  // Conversation already contains tool_result → client is managing the loop
   if (body.messages?.some((m: any) =>
     Array.isArray(m.content) && m.content.some((b: any) => b.type === "tool_result")
   )) return true
-  // System prompt has openclaw markers → stay in agent mode
   const sysText = Array.isArray(body.system)
     ? body.system.filter((b: any) => b.type === "text").map((b: any) => b.text).join(" ")
     : String(body.system ?? "")
@@ -217,29 +178,39 @@ function roughTokens(text: string): number {
 
 // ── Query options builder ────────────────────────────────────────────────────
 
-function buildQueryOptions(model: "sonnet" | "opus" | "haiku", partial?: boolean, clientToolMode?: boolean, mcpState?: McpServerState) {
-  if (clientToolMode) {
-    // Single-turn, no MCP — caller manages the tool loop
-    return {
-      maxTurns: 1,
-      model,
-      pathToClaudeCodeExecutable: claudeExecutable,
-      ...(partial ? { includePartialMessages: true } : {}),
-      disallowedTools: [...BLOCKED_BUILTIN_TOOLS],
-    }
-  }
-  return {
-    maxTurns: 50,
+function buildQueryOptions(
+  model: "sonnet" | "opus" | "haiku",
+  opts: {
+    partial?: boolean
+    clientToolMode?: boolean
+    clientSystemPrompt?: string
+    mcpState?: McpServerState
+  } = {}
+) {
+  const base = {
     model,
     pathToClaudeCodeExecutable: claudeExecutable,
-    ...(partial ? { includePartialMessages: true } : {}),
+    permissionMode: "bypassPermissions" as const,
+    allowDangerouslySkipPermissions: true,
+    ...(opts.partial ? { includePartialMessages: true } : {}),
     disallowedTools: [...BLOCKED_BUILTIN_TOOLS],
-    allowedTools: [...ALLOWED_MCP_TOOLS],
-    mcpServers: {
-      // Fresh instance per request — avoids concurrency issues when multiple
-      // requests share the same SDK MCP server object.
-      [MCP_SERVER_NAME]: createMcpServer(mcpState)
+  }
+
+  if (opts.clientToolMode) {
+    // Disable ALL built-in tools — the caller manages its own tool loop.
+    // Inject tool definitions via systemPrompt so Claude respects them.
+    return {
+      ...base,
+      maxTurns: 1,
+      tools: [] as string[],
+      ...(opts.clientSystemPrompt ? { systemPrompt: opts.clientSystemPrompt } : {}),
     }
+  }
+
+  return {
+    ...base,
+    maxTurns: 50,
+    mcpServers: { [MCP_SERVER_NAME]: createMcpServer(opts.mcpState) }
   }
 }
 
@@ -279,7 +250,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
   app.get("/v1/models/:id", handleModel)
   app.get("/models/:id", handleModel)
 
-  // Rough token count — enough to satisfy clients that call this before streaming
   const handleCountTokens = async (c: Context) => {
     try {
       const body = await c.req.json()
@@ -289,8 +259,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       const msgText = (body.messages ?? [])
         .map((m: any) => typeof m.content === "string" ? m.content : JSON.stringify(m.content))
         .join("\n")
-      const inputTokens = roughTokens(sysText + msgText)
-      return c.json({ input_tokens: inputTokens })
+      return c.json({ input_tokens: roughTokens(sysText + msgText) })
     } catch {
       return c.json({ input_tokens: 0 })
     }
@@ -303,7 +272,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
     try {
       const body = await c.req.json()
 
-      // Basic request validation
       if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
         return c.json({ type: "error", error: { type: "invalid_request_error", message: "messages is required and must be a non-empty array" } }, 400)
       }
@@ -317,7 +285,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
       const tempFiles: string[] = []
 
-      // System prompt — extract text from string or block array
       let systemContext = ""
       if (body.system) {
         if (typeof body.system === "string") {
@@ -330,7 +297,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         }
       }
 
-      // Conversation history
       const conversationParts = body.messages
         ?.map((m: { role: string; content: string | Array<any> }) => {
           const role = m.role === "assistant" ? "Assistant" : "Human"
@@ -338,20 +304,27 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         })
         .join("\n\n") || ""
 
-      // Build prompt differently depending on mode:
-      //   agent mode  → inject SEND_MESSAGE_NOTE for openclaw's MCP message tool
-      //   client tool → inject caller's tool definitions; no MCP notes
-      const toolsSection = clientToolMode ? buildClientToolsPrompt(body.tools) : SEND_MESSAGE_NOTE
-      const prompt = systemContext
-        ? `${systemContext}${toolsSection}\n\n${conversationParts}`
-        : `${toolsSection}\n\n${conversationParts}`
+      // Client tool mode: put system+tools into SDK systemPrompt, conversation as prompt.
+      // Agent mode: pass system + conversation as prompt text, no injected notes.
+      let prompt: string
+      let clientSystemPrompt: string | undefined
+      if (clientToolMode) {
+        const toolsSection = buildClientToolsPrompt(body.tools)
+        clientSystemPrompt = systemContext
+          ? `${systemContext}${toolsSection}`
+          : toolsSection
+        prompt = conversationParts
+      } else {
+        prompt = systemContext
+          ? `${systemContext}\n\n${conversationParts}`
+          : conversationParts
+      }
 
       // ── Non-streaming ──────────────────────────────────────────────────────
       if (!stream) {
-        // Reset on each assistant turn — only the FINAL turn's text is returned.
         let fullText = ""
         try {
-          for await (const message of query({ prompt, options: buildQueryOptions(model, false, clientToolMode, mcpState) })) {
+          for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: false, clientToolMode, clientSystemPrompt, mcpState }) })) {
             if (message.type === "assistant") {
               fullText = ""
               for (const block of message.message.content) {
@@ -379,26 +352,21 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
           })
         }
 
-        // Agent mode: if the message tool delivered anything, suppress the text response.
+        // If the MCP message tool delivered anything, suppress the proxy's
+        // own text response so the client doesn't double-deliver.
         if (mcpState.messageSent) fullText = "NO_REPLY"
-        const normalized = normalizeResponse(fullText)
-        claudeLog("proxy.response", { reqId, len: normalized.length, messageSent: mcpState.messageSent })
+        if (!fullText || !fullText.trim()) fullText = "..."
+        claudeLog("proxy.response", { reqId, len: fullText.length, messageSent: mcpState.messageSent })
         return c.json({
           id: `msg_${Date.now()}`,
           type: "message", role: "assistant",
-          content: [{ type: "text", text: normalized }],
+          content: [{ type: "text", text: fullText }],
           model: body.model, stop_reason: "end_turn", stop_sequence: null,
-          usage: { input_tokens: roughTokens(prompt), output_tokens: roughTokens(normalized) }
+          usage: { input_tokens: roughTokens(prompt), output_tokens: roughTokens(fullText) }
         })
       }
 
       // ── Streaming ──────────────────────────────────────────────────────────
-      // message_start is emitted immediately so the client sees an active stream
-      // before the agent does any work — prevents HTTP timeouts on long runs.
-      //
-      // Agent mode:      stream text deltas in real-time during the run.
-      // Client tool mode: buffer output, then emit proper content blocks (text +
-      //                   tool_use) at the end with correct stop_reason.
       const encoder = new TextEncoder()
       const readable = new ReadableStream({
         async start(controller) {
@@ -424,11 +392,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               }
             })
 
-            // ── Client tool mode: buffer → emit blocks at end ───────────────
+            // ── Client tool mode: buffer → emit blocks at end ─────────────
             if (clientToolMode) {
               let fullText = ""
               try {
-                for await (const message of query({ prompt, options: buildQueryOptions(model, true, true) })) {
+                for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, clientToolMode: true, clientSystemPrompt }) })) {
                   if (message.type === "stream_event") {
                     const ev = message.event as any
                     if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
@@ -445,21 +413,18 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               claudeLog("proxy.stream.done", { reqId, len: fullText.length, toolCalls: toolCalls.length })
 
               let blockIdx = 0
-              // Emit text block if there's content before tool calls, or no tools
-              const textContent = toolCalls.length === 0 ? normalizeResponse(fullText) : textBefore
+              const textContent = toolCalls.length === 0 ? (fullText || "...") : textBefore
               if (textContent) {
                 sse("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "text", text: "" } })
                 sse("content_block_delta", { type: "content_block_delta", index: blockIdx, delta: { type: "text_delta", text: textContent } })
                 sse("content_block_stop", { type: "content_block_stop", index: blockIdx })
                 blockIdx++
               } else if (toolCalls.length === 0) {
-                // No text, no tools — emit fallback
                 sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
                 sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "..." } })
                 sse("content_block_stop", { type: "content_block_stop", index: 0 })
                 blockIdx = 1
               }
-              // Emit tool_use blocks
               for (const tc of toolCalls) {
                 sse("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "tool_use", id: tc.id, name: tc.name, input: "" } })
                 sse("content_block_delta", { type: "content_block_delta", index: blockIdx, delta: { type: "input_json_delta", partial_json: JSON.stringify(tc.input) } })
@@ -474,12 +439,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               return
             }
 
-            // ── Agent mode: stream text deltas in real-time ─────────────────
+            // ── Agent mode: stream text deltas in real-time ───────────────
             sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
 
             let fullText = ""
             try {
-              for await (const message of query({ prompt, options: buildQueryOptions(model, true, false, mcpState) })) {
+              for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, mcpState }) })) {
                 if (message.type === "stream_event") {
                   const ev = message.event as any
                   if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
@@ -498,14 +463,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
             claudeLog("proxy.stream.done", { reqId, len: fullText.length, messageSent: mcpState.messageSent })
 
-            if (mcpState.messageSent) {
-              // Messages were delivered via tool — append NO_REPLY so openclaw suppresses
-              // the streamed text response (avoids double-delivering to Telegram).
-              if (!fullText.trimEnd().endsWith("NO_REPLY")) {
-                sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "\nNO_REPLY" } })
-              }
+            // Auto-suppress: if messages were delivered via the MCP message tool,
+            // append NO_REPLY so the client knows not to double-deliver.
+            if (mcpState.messageSent && !fullText.trimEnd().endsWith("NO_REPLY")) {
+              sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "\nNO_REPLY" } })
             } else if (!fullText || !fullText.trim()) {
-              // Empty response fallback
               sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "..." } })
             }
 
