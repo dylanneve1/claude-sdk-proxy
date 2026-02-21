@@ -6,13 +6,17 @@ import type { ProxyConfig } from "./types"
 import { DEFAULT_PROXY_CONFIG } from "./types"
 import { claudeLog } from "../logger"
 import { execSync } from "child_process"
-import { existsSync } from "fs"
+import { existsSync, writeFileSync, unlinkSync } from "fs"
+import { tmpdir } from "os"
+import { randomBytes } from "crypto"
 import { fileURLToPath } from "url"
 import { join, dirname } from "path"
-import { opencodeMcpServer } from "../mcpTools"
+import { createMcpServer } from "../mcpTools"
 
+// Built-in Claude Code tools to block. "Read" is intentionally kept so Claude
+// can open image temp-files saved from inbound media blocks.
 const BLOCKED_BUILTIN_TOOLS = [
-  "Read", "Write", "Edit", "MultiEdit",
+  "Write", "Edit", "MultiEdit",
   "Bash", "Glob", "Grep", "NotebookEdit",
   "WebFetch", "WebSearch", "TodoWrite"
 ]
@@ -25,24 +29,32 @@ const ALLOWED_MCP_TOOLS = [
   `mcp__${MCP_SERVER_NAME}__edit`,
   `mcp__${MCP_SERVER_NAME}__bash`,
   `mcp__${MCP_SERVER_NAME}__glob`,
-  `mcp__${MCP_SERVER_NAME}__grep`
+  `mcp__${MCP_SERVER_NAME}__grep`,
+  `mcp__${MCP_SERVER_NAME}__send_message`,
 ]
 
+// Injected after the system prompt. Teaches Claude how to send multiple
+// separate Telegram messages using the send_message MCP tool.
+const SEND_MESSAGE_NOTE = `
+## Sending multiple Telegram messages
+Your text response is delivered as a single Telegram message automatically — for normal replies just return text.
+Use \`mcp__opencode__send_message\` ONLY when explicitly asked to send multiple SEPARATE messages in one turn.
+- Extract the chat ID from \`conversation_label\` in the user message (format: "… chat id:-1001234567890").
+- Call it once per message with the chat ID and text.
+- After ALL calls are done output only: NO_REPLY
+- Never use send_message for a single reply — just return the text directly.`
+
 function resolveClaudeExecutable(): string {
-  // 1. Try the SDK's bundled cli.js (same dir as this module's SDK)
   try {
     const sdkPath = fileURLToPath(import.meta.resolve("@anthropic-ai/claude-agent-sdk"))
     const sdkCliJs = join(dirname(sdkPath), "cli.js")
     if (existsSync(sdkCliJs)) return sdkCliJs
   } catch {}
-
-  // 2. Try the system-installed claude binary
   try {
     const claudePath = execSync("which claude", { encoding: "utf-8" }).trim()
     if (claudePath && existsSync(claudePath)) return claudePath
   } catch {}
-
-  throw new Error("Could not find Claude Code executable. Install via: npm install -g @anthropic-ai/claude-code")
+  throw new Error("Could not find Claude Code executable. Install: npm install -g @anthropic-ai/claude-code")
 }
 
 const claudeExecutable = resolveClaudeExecutable()
@@ -53,31 +65,132 @@ function mapModelToClaudeModel(model: string): "sonnet" | "opus" | "haiku" {
   return "sonnet"
 }
 
+// ── Content-block serialization ──────────────────────────────────────────────
+
+function saveImageToTemp(block: any, tempFiles: string[]): string | null {
+  try {
+    let data: string | undefined
+    let mediaType = "image/jpeg"
+
+    if (typeof block.data === "string") {
+      // openclaw format: { type: "image", data: "<base64>", media_type?: "…" }
+      data = block.data
+      mediaType = block.media_type || mediaType
+    } else if (block.source) {
+      // Anthropic API format: { type: "image", source: { type: "base64", data, media_type } }
+      if (block.source.type === "base64" && block.source.data) {
+        data = block.source.data
+        mediaType = block.source.media_type || mediaType
+      } else if (block.source.url) {
+        return block.source.url
+      }
+    }
+
+    if (!data) return null
+
+    const ext = mediaType.split("/")[1]?.replace("jpeg", "jpg") || "jpg"
+    const tmpPath = join(tmpdir(), `openclaw-img-${randomBytes(8).toString("hex")}.${ext}`)
+    writeFileSync(tmpPath, Buffer.from(data, "base64"))
+    tempFiles.push(tmpPath)
+    return tmpPath
+  } catch {
+    return null
+  }
+}
+
+function serializeBlock(block: any, tempFiles: string[]): string {
+  switch (block.type) {
+    case "text":
+      return block.text || ""
+    case "image": {
+      const imgPath = saveImageToTemp(block, tempFiles)
+      return imgPath ? `[Image: ${imgPath}]` : "[Image: (unable to save)]"
+    }
+    case "tool_use":
+      return `[Tool call: ${block.name}\nInput: ${JSON.stringify(block.input ?? {}, null, 2)}]`
+    case "tool_result": {
+      const content = Array.isArray(block.content)
+        ? block.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("")
+        : String(block.content ?? "")
+      return `[Tool result (id=${block.tool_use_id}): ${content}]`
+    }
+    case "thinking":
+      return ""
+    default:
+      return ""
+  }
+}
+
+function serializeContent(content: string | Array<any>, tempFiles: string[]): string {
+  if (typeof content === "string") return content
+  if (!Array.isArray(content)) return String(content)
+  return content.map(b => serializeBlock(b, tempFiles)).filter(Boolean).join("\n")
+}
+
+function cleanupTempFiles(tempFiles: string[]) {
+  for (const f of tempFiles) {
+    try { unlinkSync(f) } catch {}
+  }
+}
+
+// ── Response normalization ───────────────────────────────────────────────────
+
+// If the model used send_message tools, it may output verbose text before
+// NO_REPLY. openclaw's isSilentReplyText already handles "ends with NO_REPLY",
+// but we normalize to just "NO_REPLY" for a clean session history.
+function normalizeResponse(text: string): string {
+  if (!text) return "NO_REPLY"
+  const trimmed = text.trimEnd()
+  if (trimmed.endsWith("NO_REPLY")) return "NO_REPLY"
+  return text
+}
+
+// ── Query options builder ────────────────────────────────────────────────────
+
+function buildQueryOptions(model: "sonnet" | "opus" | "haiku", partial?: boolean) {
+  return {
+    maxTurns: 15, // enough for multi-message sends; keeps latency reasonable
+    model,
+    pathToClaudeCodeExecutable: claudeExecutable,
+    ...(partial ? { includePartialMessages: true } : {}),
+    disallowedTools: [...BLOCKED_BUILTIN_TOOLS],
+    allowedTools: [...ALLOWED_MCP_TOOLS],
+    mcpServers: {
+      // Fresh instance per request — avoids concurrency issues when multiple
+      // requests share the same SDK MCP server object.
+      [MCP_SERVER_NAME]: createMcpServer()
+    }
+  }
+}
+
+// ── Route handler ────────────────────────────────────────────────────────────
+
 export function createProxyServer(config: Partial<ProxyConfig> = {}) {
   const finalConfig = { ...DEFAULT_PROXY_CONFIG, ...config }
   const app = new Hono()
 
   app.use("*", cors())
 
-  app.get("/", (c) => {
-    return c.json({
-      status: "ok",
-      service: "claude-max-proxy",
-      version: "1.0.0",
-      format: "anthropic",
-      endpoints: ["/v1/messages", "/messages"]
-    })
-  })
+  app.get("/", (c) => c.json({
+    status: "ok",
+    service: "claude-max-proxy",
+    version: "1.0.0",
+    format: "anthropic",
+    endpoints: ["/v1/messages", "/messages"]
+  }))
 
   const handleMessages = async (c: Context) => {
+    const reqId = randomBytes(4).toString("hex")
     try {
       const body = await c.req.json()
       const model = mapModelToClaudeModel(body.model || "sonnet")
       const stream = body.stream ?? true
 
-      claudeLog("proxy.anthropic.request", { model, stream, messageCount: body.messages?.length })
+      claudeLog("proxy.request", { reqId, model, stream, msgs: body.messages?.length })
 
-      // Build system context from the request's system prompt
+      const tempFiles: string[] = []
+
+      // System prompt
       let systemContext = ""
       if (body.system) {
         if (typeof body.system === "string") {
@@ -90,61 +203,38 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         }
       }
 
-      // Convert messages to a text prompt
+      // Conversation history
       const conversationParts = body.messages
-        ?.map((m: { role: string; content: string | Array<{ type: string; text?: string }> }) => {
+        ?.map((m: { role: string; content: string | Array<any> }) => {
           const role = m.role === "assistant" ? "Assistant" : "Human"
-          let content: string
-          if (typeof m.content === "string") {
-            content = m.content
-          } else if (Array.isArray(m.content)) {
-            content = m.content
-              .filter((block: any) => block.type === "text" && block.text)
-              .map((block: any) => block.text)
-              .join("")
-          } else {
-            content = String(m.content)
-          }
-          return `${role}: ${content}`
+          return `${role}: ${serializeContent(m.content, tempFiles)}`
         })
         .join("\n\n") || ""
 
-      // Combine system context with conversation
+      // Build prompt: system context + send_message guidance + conversation.
+      // SEND_MESSAGE_NOTE is always appended so the tool is explained even
+      // when there is no system prompt (e.g. plain API calls).
       const prompt = systemContext
-        ? `${systemContext}\n\n${conversationParts}`
-        : conversationParts
+        ? `${systemContext}${SEND_MESSAGE_NOTE}\n\n${conversationParts}`
+        : `${SEND_MESSAGE_NOTE}\n\n${conversationParts}`
 
+      // ── Non-streaming ──────────────────────────────────────────────────────
       if (!stream) {
         let fullContent = ""
-        const response = query({
-          prompt,
-          options: {
-            maxTurns: 100,
-            model,
-            pathToClaudeCodeExecutable: claudeExecutable,
-            disallowedTools: [...BLOCKED_BUILTIN_TOOLS],
-            allowedTools: [...ALLOWED_MCP_TOOLS],
-            mcpServers: {
-              [MCP_SERVER_NAME]: opencodeMcpServer
-            }
-          }
-        })
-
-        for await (const message of response) {
-          if (message.type === "assistant") {
-            for (const block of message.message.content) {
-              if (block.type === "text") {
-                fullContent += block.text
+        try {
+          for await (const message of query({ prompt, options: buildQueryOptions(model) })) {
+            if (message.type === "assistant") {
+              for (const block of message.message.content) {
+                if (block.type === "text") fullContent += block.text
               }
             }
           }
+        } finally {
+          cleanupTempFiles(tempFiles)
         }
 
-        // If no text content was produced (e.g. only tool_use), return a fallback
-        if (!fullContent) {
-          fullContent = "I can help with that. Could you provide more details about what you'd like me to do?"
-        }
-
+        fullContent = normalizeResponse(fullContent)
+        claudeLog("proxy.response", { reqId, len: fullContent.length })
         return c.json({
           id: `msg_${Date.now()}`,
           type: "message",
@@ -156,83 +246,65 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         })
       }
 
+      // ── Streaming ──────────────────────────────────────────────────────────
       const encoder = new TextEncoder()
       const readable = new ReadableStream({
         async start(controller) {
           try {
-            const response = query({
-              prompt,
-              options: {
-                maxTurns: 100,
-                model,
-                pathToClaudeCodeExecutable: claudeExecutable,
-                includePartialMessages: true,
-                disallowedTools: [...BLOCKED_BUILTIN_TOOLS],
-                allowedTools: [...ALLOWED_MCP_TOOLS],
-                mcpServers: {
-                  [MCP_SERVER_NAME]: opencodeMcpServer
-                }
-              }
-            })
-
             const heartbeat = setInterval(() => {
-              try {
-                controller.enqueue(encoder.encode(`: ping\n\n`))
-              } catch {
-                clearInterval(heartbeat)
-              }
+              try { controller.enqueue(encoder.encode(": ping\n\n")) } catch { clearInterval(heartbeat) }
             }, 15_000)
 
-            const skipBlockIndices = new Set<number>()
+            // Collect all text across the full multi-turn agent run, then emit
+            // a single clean SSE sequence. This avoids out-of-order SSE events
+            // that confuse openclaw's parser.
+            let fullText = ""
+            let messageId = `msg_${Date.now()}`
 
             try {
-              for await (const message of response) {
+              for await (const message of query({ prompt, options: buildQueryOptions(model, true) })) {
                 if (message.type === "stream_event") {
-                  const event = message.event
-                  const eventType = event.type
-                  const eventIndex = (event as any).index as number | undefined
-
-                  // Filter out tool_use content blocks — OpenCode expects text only
-                  if (eventType === "content_block_start") {
-                    const block = (event as any).content_block
-                    if (block?.type === "tool_use") {
-                      if (eventIndex !== undefined) skipBlockIndices.add(eventIndex)
-                      continue
-                    }
+                  const ev = message.event as any
+                  if (ev.type === "message_start") {
+                    messageId = ev.message?.id || messageId
+                  } else if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
+                    fullText += ev.delta.text ?? ""
                   }
-
-                  // Skip deltas and stops for tool_use blocks
-                  if (eventIndex !== undefined && skipBlockIndices.has(eventIndex)) {
-                    continue
-                  }
-
-                  // Override message_delta to always show end_turn
-                  if (eventType === "message_delta") {
-                    const patched = {
-                      ...event,
-                      delta: { ...((event as any).delta || {}), stop_reason: "end_turn" },
-                      usage: (event as any).usage || { output_tokens: 0 }
-                    }
-                    controller.enqueue(encoder.encode(`event: ${eventType}\ndata: ${JSON.stringify(patched)}\n\n`))
-                    continue
-                  }
-
-                  // Forward all other events (message_start, text deltas, content_block_start/stop for text, message_stop)
-                  controller.enqueue(encoder.encode(`event: ${eventType}\ndata: ${JSON.stringify(event)}\n\n`))
                 }
               }
             } finally {
               clearInterval(heartbeat)
+              cleanupTempFiles(tempFiles)
             }
 
+            fullText = normalizeResponse(fullText)
+            claudeLog("proxy.stream.done", { reqId, len: fullText.length })
+
+            const sse = (event: string, data: object) =>
+              controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`))
+
+            sse("message_start", {
+              type: "message_start",
+              message: { id: messageId, type: "message", role: "assistant", content: [],
+                model: body.model, stop_reason: null, stop_sequence: null,
+                usage: { input_tokens: 0, output_tokens: 0 } }
+            })
+            sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
+            sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: fullText } })
+            sse("content_block_stop", { type: "content_block_stop", index: 0 })
+            sse("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: fullText.length } })
+            sse("message_stop", { type: "message_stop" })
             controller.close()
+
           } catch (error) {
-            claudeLog("proxy.anthropic.error", { error: error instanceof Error ? error.message : String(error) })
-            controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({
-              type: "error",
-              error: { type: "api_error", message: error instanceof Error ? error.message : "Unknown error" }
-            })}\n\n`))
-            controller.close()
+            claudeLog("proxy.stream.error", { reqId, error: error instanceof Error ? error.message : String(error) })
+            cleanupTempFiles(tempFiles)
+            try {
+              controller.enqueue(encoder.encode(
+                `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: error instanceof Error ? error.message : "Unknown error" } })}\n\n`
+              ))
+              controller.close()
+            } catch {}
           }
         }
       })
@@ -241,17 +313,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         headers: {
           "Content-Type": "text/event-stream",
           "Cache-Control": "no-cache",
-          Connection: "keep-alive"
+          "Connection": "keep-alive"
         }
       })
+
     } catch (error) {
-      claudeLog("proxy.error", { error: error instanceof Error ? error.message : String(error) })
+      claudeLog("proxy.error", { reqId, error: error instanceof Error ? error.message : String(error) })
       return c.json({
         type: "error",
-        error: {
-          type: "api_error",
-          message: error instanceof Error ? error.message : "Unknown error"
-        }
+        error: { type: "api_error", message: error instanceof Error ? error.message : "Unknown error" }
       }, 500)
     }
   }
@@ -268,12 +338,10 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}) {
   const server = Bun.serve({
     port: finalConfig.port,
     hostname: finalConfig.host,
-    fetch: app.fetch
+    fetch: app.fetch,
+    idleTimeout: 0
   })
 
-  console.log(`Claude Max Proxy (Anthropic API) running at http://${finalConfig.host}:${finalConfig.port}`)
-  console.log(`\nTo use with OpenCode, run:`)
-  console.log(`  ANTHROPIC_API_KEY=dummy ANTHROPIC_BASE_URL=http://${finalConfig.host}:${finalConfig.port} opencode`)
-
+  console.log(`Claude Max Proxy running at http://${finalConfig.host}:${finalConfig.port}`)
   return server
 }

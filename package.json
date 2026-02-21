@@ -1,11 +1,11 @@
 {
-  "name": "opencode-claude-max-proxy",
-  "version": "1.0.2",
-  "description": "Use your Claude Max subscription with OpenCode via proxy server",
+  "name": "claude-proxy",
+  "version": "2.0.0",
+  "description": "Claude Max proxy for openclaw — translates Anthropic Messages API to Claude Agent SDK, with native Telegram multi-message support via openclaw gateway",
   "type": "module",
   "main": "./src/proxy/server.ts",
   "bin": {
-    "claude-max-proxy": "./bin/claude-proxy.ts"
+    "claude-proxy": "./bin/claude-proxy.ts"
   },
   "exports": {
     ".": "./src/proxy/server.ts"
@@ -28,34 +28,29 @@
   },
   "files": [
     "bin/",
-    "src/proxy/",
-    "src/logger.ts",
+    "src/",
     "README.md"
   ],
   "keywords": [
-    "opencode",
-    "opencode-ai",
-    "opencode-plugin",
+    "openclaw",
     "claude",
     "claude-max",
     "claude-code",
     "anthropic",
-    "ai-coding",
-    "ai-assistant",
     "proxy",
     "claude-agent-sdk",
-    "llm",
-    "coding-assistant"
+    "telegram",
+    "gateway"
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rynfar/opencode-claude-max-proxy.git"
+    "url": "git+https://github.com/dylanneve1/claude-proxy.git"
   },
-  "homepage": "https://github.com/rynfar/opencode-claude-max-proxy#readme",
+  "homepage": "https://github.com/dylanneve1/claude-proxy#readme",
   "bugs": {
-    "url": "https://github.com/rynfar/opencode-claude-max-proxy/issues"
+    "url": "https://github.com/dylanneve1/claude-proxy/issues"
   },
-  "author": "rynfar",
+  "author": "dylanneve1",
   "license": "MIT",
   "private": false
 }
