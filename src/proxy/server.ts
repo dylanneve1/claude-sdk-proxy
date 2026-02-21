@@ -312,13 +312,21 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
     { type: "model", id: "claude-haiku-4-5-20251001",    display_name: "Claude Haiku 4.5",   created_at: "2025-10-01T00:00:00Z" },
   ]
 
-  const handleModels = (c: Context) => c.json({ data: MODELS })
+  // Dual-format model data: includes fields for both Anthropic and OpenAI SDKs
+  const MODELS_DUAL = MODELS.map(m => ({
+    ...m,
+    object: "model" as const,
+    created: Math.floor(new Date(m.created_at).getTime() / 1000),
+    owned_by: "anthropic" as const
+  }))
+
+  const handleModels = (c: Context) => c.json({ object: "list", data: MODELS_DUAL })
   app.get("/v1/models", handleModels)
   app.get("/models", handleModels)
 
   const handleModel = (c: Context) => {
     const id = c.req.param("id")
-    const model = MODELS.find(m => m.id === id)
+    const model = MODELS_DUAL.find(m => m.id === id)
     if (!model) return c.json({ type: "error", error: { type: "not_found_error", message: `Model \`${id}\` not found` } }, 404)
     return c.json(model)
   }
