@@ -1,5 +1,26 @@
 # Changelog
 
+## [2.2.0](https://github.com/dylanneve1/claude-sdk-proxy/compare/v2.1.0...v2.2.0) (2026-02-22)
+
+
+### Features
+
+* API key auth, Docker support, extended thinking, error handling ([9e7bd4d](https://github.com/dylanneve1/claude-sdk-proxy/commit/9e7bd4d46da7a810d319c26fb9fceaf29a9ef940))
+* concurrency control, anthropic-version headers, queue status ([21468c2](https://github.com/dylanneve1/claude-sdk-proxy/commit/21468c2a3f1280692995114976ac31b28c9b0e32))
+* dual-format /v1/models for Anthropic and OpenAI SDK compat ([b431e58](https://github.com/dylanneve1/claude-sdk-proxy/commit/b431e58865bc320ec7f6cd7eccf4f1b6571420ba))
+* graceful shutdown, batches stub, test coverage ([8603ef1](https://github.com/dylanneve1/claude-sdk-proxy/commit/8603ef1d7c606200c4a6a1ad79df93e00ff7efe0))
+* OpenAI tool_call and multi-modal image support ([213cf54](https://github.com/dylanneve1/claude-sdk-proxy/commit/213cf54df584789f1e0458187de607b38b2bf045))
+* OpenAI-compatible /v1/chat/completions endpoint ([5a73457](https://github.com/dylanneve1/claude-sdk-proxy/commit/5a73457d4e34269082453fb42a7d0ee661293e3e))
+* real-time token streaming and OpenAI auth forwarding ([37c5809](https://github.com/dylanneve1/claude-sdk-proxy/commit/37c580962df3ed2f46fa63a6f527ddc9ab010322))
+* rename package to claude-sdk-proxy ([a8ca6bb](https://github.com/dylanneve1/claude-sdk-proxy/commit/a8ca6bbb7a42533803d9d6487cdbd1816d0c8f4d))
+
+
+### Bug Fixes
+
+* add .js bin wrapper so npx claude-sdk-proxy works ([de7edf8](https://github.com/dylanneve1/claude-sdk-proxy/commit/de7edf8b1e8525def7f828d2d4693f388e33e369))
+* agent mode turn buffering, tool_use XML serialization, OpenAI streaming ([7a2d46e](https://github.com/dylanneve1/claude-sdk-proxy/commit/7a2d46e0e053a4e7b36dd736538cc6e9628fc0f4))
+* default to non-streaming responses for chat app compatibility ([cb13bda](https://github.com/dylanneve1/claude-sdk-proxy/commit/cb13bda491c9b840ec894da90594b2951dca68da))
+
 ## [2.1.0](https://github.com/dylanneve1/claude-proxy/compare/v2.0.0...v2.1.0) (2026-02-21)
 
 
