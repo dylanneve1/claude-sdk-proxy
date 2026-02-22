@@ -185,7 +185,7 @@ claude-sdk-proxy [options]
 | `CLAUDE_PROXY_DEBUG` | unset | Enable debug logging (`1` to enable) |
 | `CLAUDE_PROXY_API_KEY` | unset | When set, require this key via `x-api-key` or `Authorization: Bearer` header |
 | `CLAUDE_PROXY_MAX_CONCURRENT` | `5` | Max simultaneous Claude SDK sessions |
-| `CLAUDE_PROXY_TIMEOUT_MS` | `300000` | Per-request timeout in milliseconds |
+| `CLAUDE_PROXY_TIMEOUT_MS` | `1800000` | Per-request timeout in milliseconds (default 30 minutes) |
 
 ## Testing
 

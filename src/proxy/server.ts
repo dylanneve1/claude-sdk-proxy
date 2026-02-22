@@ -13,6 +13,15 @@ import { fileURLToPath } from "url"
 import { join, dirname } from "path"
 import { createMcpServer, type McpServerState } from "../mcpTools"
 
+// Base62 ID generator — matches Anthropic's real ID format (e.g. msg_01XFDUDYJgAACzvnptvVoYEL)
+const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+function generateId(prefix: string, length = 24): string {
+  const bytes = randomBytes(length)
+  let id = prefix
+  for (let i = 0; i < length; i++) id += BASE62[bytes[i]! % 62]
+  return id
+}
+
 const PROXY_VERSION: string = (() => {
   try {
     const pkg = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../package.json"), "utf-8"))
@@ -197,7 +206,7 @@ function parseToolUse(text: string): { toolCalls: ToolCall[]; textBefore: string
     try {
       const p = JSON.parse(m[1]!.trim())
       calls.push({
-        id: `toolu_${randomBytes(16).toString("hex")}`,
+        id: generateId("toolu_"),
         name: String(p.name ?? ""),
         input: p.input ?? {}
       })
@@ -212,7 +221,7 @@ function parseToolUse(text: string): { toolCalls: ToolCall[]; textBefore: string
       try {
         const input = JSON.parse(m[2]!.trim())
         calls.push({
-          id: `toolu_${randomBytes(16).toString("hex")}`,
+          id: generateId("toolu_"),
           name: m[1]!.trim(),
           input
         })
@@ -237,7 +246,7 @@ function buildQueryOptions(
     systemPrompt?: string
     mcpState?: McpServerState
     abortController?: AbortController
-    maxThinkingTokens?: number
+    thinking?: { type: "adaptive" } | { type: "enabled"; budgetTokens?: number } | { type: "disabled" }
   } = {}
 ) {
   const base = {
@@ -249,7 +258,7 @@ function buildQueryOptions(
     settingSources: [],
     ...(opts.partial ? { includePartialMessages: true } : {}),
     ...(opts.abortController ? { abortController: opts.abortController } : {}),
-    ...(opts.maxThinkingTokens ? { maxThinkingTokens: opts.maxThinkingTokens } : {}),
+    ...(opts.thinking ? { thinking: opts.thinking } : {}),
     ...(opts.systemPrompt ? { systemPrompt: opts.systemPrompt } : {}),
     disallowedTools: [...BLOCKED_BUILTIN_TOOLS],
   }
@@ -266,7 +275,7 @@ function buildQueryOptions(
 
   return {
     ...base,
-    maxTurns: 50,
+    maxTurns: 200,
     mcpServers: { [MCP_SERVER_NAME]: createMcpServer(opts.mcpState) }
   }
 }
@@ -291,7 +300,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       if (key !== requiredApiKey) {
         return c.json({
           type: "error",
-          error: { type: "authentication_error", message: "Invalid API key" }
+          error: { type: "authentication_error", message: "Invalid API key" },
+          request_id: c.res.headers.get("request-id") ?? generateId("req_")
         }, 401)
       }
       return next()
@@ -301,11 +311,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
   // Anthropic-compatible headers + request logging
   app.use("*", async (c, next) => {
     const start = Date.now()
-    const requestId = c.req.header("x-request-id") ?? `req_${randomBytes(12).toString("hex")}`
+    const requestId = c.req.header("x-request-id") ?? generateId("req_")
     c.header("x-request-id", requestId)
     c.header("request-id", requestId)
     // Echo back Anthropic-standard headers
-    c.header("anthropic-version", "2024-10-22")
+    c.header("anthropic-version", "2023-06-01")
     const betaHeader = c.req.header("anthropic-beta")
     if (betaHeader) c.header("anthropic-beta", betaHeader)
     await next()
@@ -315,7 +325,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
   app.get("/", (c) => c.json({
     status: "ok",
-    service: "claude-max-proxy",
+    service: "claude-sdk-proxy",
     version: PROXY_VERSION,
     format: "anthropic",
     endpoints: ["/v1/messages", "/v1/models", "/v1/chat/completions"],
@@ -371,17 +381,17 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
   app.post("/messages/count_tokens", handleCountTokens)
 
   const handleMessages = async (c: Context) => {
-    const reqId = randomBytes(4).toString("hex")
+    const reqId = generateId("req_")
     try {
       let body: any
       try {
         body = await c.req.json()
       } catch {
-        return c.json({ type: "error", error: { type: "invalid_request_error", message: "Request body must be valid JSON" } }, 400)
+        return c.json({ type: "error", error: { type: "invalid_request_error", message: "Request body must be valid JSON" }, request_id: reqId }, 400)
       }
 
       if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
-        return c.json({ type: "error", error: { type: "invalid_request_error", message: "messages is required and must be a non-empty array" } }, 400)
+        return c.json({ type: "error", error: { type: "invalid_request_error", message: "messages is required and must be a non-empty array" }, request_id: reqId }, 400)
       }
 
       const model = mapModelToClaudeModel(body.model || "sonnet")
@@ -391,13 +401,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       const abortController = new AbortController()
       const timeout = setTimeout(() => abortController.abort(), finalConfig.requestTimeoutMs)
 
-      // Extended thinking: extract budget_tokens from thinking parameter
-      const maxThinkingTokens = body.thinking?.type === "enabled" ? body.thinking.budget_tokens : undefined
-
-      claudeLog("proxy.request", { reqId, model, stream, msgs: body.messages?.length, clientToolMode, ...(maxThinkingTokens ? { maxThinkingTokens } : {}), queueActive: requestQueue.activeCount, queueWaiting: requestQueue.waitingCount })
-
-      // Acquire a slot in the concurrency queue
-      await requestQueue.acquire()
+      // Extended thinking: map Anthropic API thinking param to SDK ThinkingConfig
+      const thinking: { type: "adaptive" } | { type: "enabled"; budgetTokens?: number } | { type: "disabled" } | undefined =
+        body.thinking?.type === "enabled" ? { type: "enabled", budgetTokens: body.thinking.budget_tokens }
+        : body.thinking?.type === "disabled" ? { type: "disabled" }
+        : body.thinking?.type === "adaptive" ? { type: "adaptive" }
+        : undefined
 
       const tempFiles: string[] = []
 
@@ -460,12 +469,18 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         prompt = serializeContent(lastMsg.content, tempFiles)
       }
 
+      claudeLog("proxy.request", { reqId, model, stream, msgs: body.messages?.length, clientToolMode, ...(thinking ? { thinking: thinking.type } : {}), queueActive: requestQueue.activeCount, queueWaiting: requestQueue.waitingCount })
+
+      // Acquire a slot in the concurrency queue — all code after this MUST
+      // release via the try/finally blocks in both streaming and non-streaming paths.
+      await requestQueue.acquire()
+
       // ── Non-streaming ──────────────────────────────────────────────────────
       if (!stream) {
         let fullText = ""
         let lastCleanText = ""
         try {
-          for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: false, clientToolMode, systemPrompt, mcpState, abortController, maxThinkingTokens }) })) {
+          for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: false, clientToolMode, systemPrompt, mcpState, abortController, thinking }) })) {
             if (message.type === "assistant") {
               let turnText = ""
               let hasToolUse = false
@@ -496,7 +511,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
           const stopReason = toolCalls.length > 0 ? "tool_use" : "end_turn"
           claudeLog("proxy.response", { reqId, len: fullText.length, toolCalls: toolCalls.length })
           return c.json({
-            id: `msg_${Date.now()}`,
+            id: generateId("msg_"),
             type: "message", role: "assistant", content,
             model: body.model, stop_reason: stopReason, stop_sequence: null,
             usage: { input_tokens: roughTokens(prompt), output_tokens: roughTokens(fullText) }
@@ -509,7 +524,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         if (!fullText || !fullText.trim()) fullText = "..."
         claudeLog("proxy.response", { reqId, len: fullText.length, messageSent: mcpState.messageSent })
         return c.json({
-          id: `msg_${Date.now()}`,
+          id: generateId("msg_"),
           type: "message", role: "assistant",
           content: [{ type: "text", text: fullText }],
           model: body.model, stop_reason: "end_turn", stop_sequence: null,
@@ -520,8 +535,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       // ── Streaming ──────────────────────────────────────────────────────────
       const encoder = new TextEncoder()
       const readable = new ReadableStream({
+        cancel() {
+          // Client disconnected — abort the SDK query to free resources
+          abortController.abort()
+        },
         async start(controller) {
-          const messageId = `msg_${Date.now()}`
+          const messageId = generateId("msg_")
           let queueReleased = false
           const releaseQueue = () => { if (!queueReleased) { queueReleased = true; requestQueue.release() } }
 
@@ -533,7 +552,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
           try {
             const heartbeat = setInterval(() => {
-              try { controller.enqueue(encoder.encode(": ping\n\n")) } catch { clearInterval(heartbeat) }
+              try { controller.enqueue(encoder.encode(`event: ping\ndata: {"type": "ping"}\n\n`)) } catch { clearInterval(heartbeat) }
             }, 15_000)
 
             sse("message_start", {
@@ -541,7 +560,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               message: {
                 id: messageId, type: "message", role: "assistant", content: [],
                 model: body.model, stop_reason: null, stop_sequence: null,
-                usage: { input_tokens: roughTokens(prompt), output_tokens: 0 }
+                usage: { input_tokens: roughTokens(prompt), output_tokens: 1 }
               }
             })
 
@@ -549,7 +568,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             if (clientToolMode) {
               let fullText = ""
               try {
-                for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, clientToolMode: true, systemPrompt, abortController, maxThinkingTokens }) })) {
+                for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, clientToolMode: true, systemPrompt, abortController, thinking }) })) {
                   if (message.type === "stream_event") {
                     const ev = message.event as any
                     if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
@@ -581,7 +600,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 blockIdx = 1
               }
               for (const tc of toolCalls) {
-                sse("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "tool_use", id: tc.id, name: tc.name, input: "" } })
+                sse("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "tool_use", id: tc.id, name: tc.name, input: {} } })
                 sse("content_block_delta", { type: "content_block_delta", index: blockIdx, delta: { type: "input_json_delta", partial_json: JSON.stringify(tc.input) } })
                 sse("content_block_stop", { type: "content_block_stop", index: blockIdx })
                 blockIdx++
@@ -604,7 +623,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             let fullText = ""
             let hasStreamed = false
             try {
-              for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, systemPrompt, mcpState, abortController, maxThinkingTokens }) })) {
+              for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, systemPrompt, mcpState, abortController, thinking }) })) {
                 if (message.type === "stream_event") {
                   const ev = message.event as any
                   if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
@@ -642,11 +661,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             releaseQueue()
             const isAbort = error instanceof Error && error.name === "AbortError"
             const errMsg = isAbort ? "Request timeout" : (error instanceof Error ? error.message : "Unknown error")
-            const errType = isAbort ? "timeout_error" : "api_error"
+            const errType = isAbort ? "overloaded_error" : "api_error"
             claudeLog("proxy.stream.error", { reqId, error: errMsg })
             cleanupTempFiles(tempFiles)
             try {
-              sse("error", { type: "error", error: { type: errType, message: errMsg } })
+              sse("error", { type: "error", error: { type: errType, message: errMsg }, request_id: reqId })
               controller.close()
             } catch {}
           }
@@ -664,10 +683,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
     } catch (error) {
       const isAbort = error instanceof Error && error.name === "AbortError"
       const errMsg = isAbort ? "Request timeout" : (error instanceof Error ? error.message : "Unknown error")
-      const errType = isAbort ? "timeout_error" : "api_error"
-      const status = isAbort ? 408 : 500
+      const errType = isAbort ? "overloaded_error" : "api_error"
       claudeLog("proxy.error", { reqId, error: errMsg })
-      return c.json({ type: "error", error: { type: errType, message: errMsg } }, status)
+      if (isAbort) {
+        return new Response(JSON.stringify({ type: "error", error: { type: errType, message: errMsg }, request_id: reqId }), {
+          status: 529, headers: { "Content-Type": "application/json" }
+        })
+      }
+      return c.json({ type: "error", error: { type: errType, message: errMsg }, request_id: reqId }, 500)
     }
   }
 
@@ -725,7 +748,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
     for (const msg of messages) {
       if (msg.role === "system") {
-        system = (system ? system + "\n" : "") + (typeof msg.content === "string" ? msg.content : "")
+        const sysText = typeof msg.content === "string" ? msg.content
+          : Array.isArray(msg.content) ? msg.content.filter((p: any) => p.type === "text").map((p: any) => p.text ?? "").join("")
+          : String(msg.content ?? "")
+        system = (system ? system + "\n" : "") + sysText
       } else if (msg.role === "user") {
         converted.push({ role: "user", content: convertOpenaiContent(msg.content) })
       } else if (msg.role === "assistant") {
@@ -794,7 +820,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       : "stop"
 
     return {
-      id: `chatcmpl-${Date.now()}`,
+      id: generateId("chatcmpl-"),
       object: "chat.completion",
       created: Math.floor(Date.now() / 1000),
       model,
@@ -835,8 +861,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         stream,
       }
       if (system) anthropicBody.system = system
-      if (body.max_tokens) anthropicBody.max_tokens = body.max_tokens
+      if (body.max_tokens || body.max_completion_tokens) {
+        anthropicBody.max_tokens = body.max_tokens ?? body.max_completion_tokens
+      }
       if (body.temperature !== undefined) anthropicBody.temperature = body.temperature
+      if (body.top_p !== undefined) anthropicBody.top_p = body.top_p
+      if (body.stop) anthropicBody.stop_sequences = Array.isArray(body.stop) ? body.stop : [body.stop]
       // Convert OpenAI tools format to Anthropic tools format
       if (body.tools?.length) {
         anthropicBody.tools = openaiToAnthropicTools(body.tools)
@@ -874,12 +904,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
             const decoder = new TextDecoder()
             let buffer = ""
-            const chatId = `chatcmpl-${Date.now()}`
+            const chatId = generateId("chatcmpl-")
             const created = Math.floor(Date.now() / 1000)
             let sentRole = false
             let finishReason: string | null = null
             // Track active tool calls for streaming
-            const activeToolCalls: Map<number, { id: string; name: string; argBuffer: string }> = new Map()
+            const activeToolCalls: Map<number, { id: string; name: string }> = new Map()
             let toolCallIndex = 0
             let usageInfo: { input_tokens: number; output_tokens: number } | null = null
 
@@ -908,7 +938,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   if (event.type === "content_block_start" && event.content_block?.type === "tool_use") {
                     // Start of a tool_use block → emit tool_call function header
                     const idx = toolCallIndex++
-                    activeToolCalls.set(event.index, { id: event.content_block.id, name: event.content_block.name, argBuffer: "" })
+                    activeToolCalls.set(event.index, { id: event.content_block.id, name: event.content_block.name })
                     controller.enqueue(encoder.encode(`data: ${JSON.stringify({
                       id: chatId, object: "chat.completion.chunk", created, model: requestedModel,
                       choices: [{ index: 0, delta: {
@@ -937,7 +967,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                     const sr = event.delta?.stop_reason
                     finishReason = sr === "tool_use" ? "tool_calls" : sr === "max_tokens" ? "length" : "stop"
                     if (event.usage) {
-                      usageInfo = { input_tokens: event.usage.input_tokens ?? 0, output_tokens: event.usage.output_tokens ?? 0 }
+                      const prevInput: number = usageInfo?.input_tokens ?? 0
+                      const prevOutput: number = usageInfo?.output_tokens ?? 0
+                      usageInfo = {
+                        input_tokens: event.usage.input_tokens ?? prevInput,
+                        output_tokens: event.usage.output_tokens ?? prevOutput
+                      }
                     }
                   } else if (event.type === "message_start" && event.message?.usage) {
                     // Capture input token count from message_start
@@ -995,6 +1030,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
     }))
   })
   app.get("/v1/chat/models", handleOpenaiModels)
+
+  // 404 catch-all — return Anthropic-format error for unknown routes
+  app.all("*", (c) => c.json({
+    type: "error",
+    error: { type: "not_found_error", message: `${c.req.method} ${c.req.path} not found` }
+  }, 404))
 
   return { app, config: finalConfig }
 }
