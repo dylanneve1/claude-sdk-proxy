@@ -17,10 +17,11 @@ bun.lockb
 .DS_Store
 Thumbs.db
 
-# Environment
+# Environment / secrets
 .env
 .env.local
 .env.*.local
+.npmrc
 
 # Logs
 *.log
@@ -32,3 +33,6 @@ coverage/
 # Temporary files
 *.tmp
 *.temp
+
+# npm pack output
+*.tgz
