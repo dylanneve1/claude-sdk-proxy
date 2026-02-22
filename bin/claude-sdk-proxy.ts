@@ -5,9 +5,9 @@ import { startProxyServer } from "../src/proxy/server"
 const args = process.argv.slice(2)
 
 if (args.includes("--help") || args.includes("-h")) {
-  console.log(`claude-proxy — Anthropic Messages API proxy backed by Claude Agent SDK
+  console.log(`claude-sdk-proxy — Anthropic Messages API proxy backed by Claude Agent SDK
 
-Usage: claude-proxy [options]
+Usage: claude-sdk-proxy [options]
 
 Options:
   -p, --port <port>   Listen port (default: 3456, env: CLAUDE_PROXY_PORT)
@@ -17,9 +17,9 @@ Options:
   -h, --help          Show this help
 
 Examples:
-  claude-proxy                       # Start on 127.0.0.1:3456
-  claude-proxy -p 8080               # Start on port 8080
-  claude-proxy -H 0.0.0.0 -p 3456   # Listen on all interfaces`)
+  claude-sdk-proxy                       # Start on 127.0.0.1:3456
+  claude-sdk-proxy -p 8080               # Start on port 8080
+  claude-sdk-proxy -H 0.0.0.0 -p 3456   # Listen on all interfaces`)
   process.exit(0)
 }
 
@@ -29,9 +29,9 @@ if (args.includes("--version") || args.includes("-v")) {
   const { fileURLToPath } = await import("url")
   try {
     const pkg = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../package.json"), "utf-8"))
-    console.log(`claude-proxy v${pkg.version}`)
+    console.log(`claude-sdk-proxy v${pkg.version}`)
   } catch {
-    console.log("claude-proxy (unknown version)")
+    console.log("claude-sdk-proxy (unknown version)")
   }
   process.exit(0)
 }
