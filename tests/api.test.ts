@@ -1,5 +1,5 @@
 /**
- * API endpoint tests for claude-proxy.
+ * API endpoint tests for claude-sdk-proxy.
  *
  * These tests verify the HTTP layer (routing, request validation, response
  * format) using Hono's testClient. They do NOT call the Claude Agent SDK —

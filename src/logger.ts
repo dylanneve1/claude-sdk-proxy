@@ -5,7 +5,7 @@ const shouldLog = () =>
 export const claudeLog = (message: string, extra?: Record<string, unknown>) => {
   if (!shouldLog()) return
   const ts = new Date().toISOString()
-  const parts = [`[${ts}] [claude-proxy]`, message]
+  const parts = [`[${ts}] [claude-sdk-proxy]`, message]
   if (extra && Object.keys(extra).length > 0) {
     parts.push(JSON.stringify(extra))
   }

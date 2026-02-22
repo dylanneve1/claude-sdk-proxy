@@ -1,5 +1,5 @@
 services:
-  claude-proxy:
+  claude-sdk-proxy:
     build: .
     ports:
       - "3456:3456"

@@ -1,18 +1,18 @@
 {
-  "name": "claude-proxy",
-  "version": "2.1.0",
+  "name": "claude-sdk-proxy",
+  "version": "2.2.0",
   "description": "Anthropic Messages API proxy backed by Claude Agent SDK — use Claude Max with any API client",
   "type": "module",
   "main": "./src/proxy/server.ts",
   "bin": {
-    "claude-proxy": "./bin/claude-proxy.ts"
+    "claude-sdk-proxy": "./bin/claude-sdk-proxy.ts"
   },
   "exports": {
     ".": "./src/proxy/server.ts"
   },
   "scripts": {
-    "start": "bun run ./bin/claude-proxy.ts",
-    "proxy": "bun run ./bin/claude-proxy.ts",
+    "start": "bun run ./bin/claude-sdk-proxy.ts",
+    "proxy": "bun run ./bin/claude-sdk-proxy.ts",
     "test": "bun test tests/helpers.test.ts tests/api.test.ts tests/openai-compat.test.ts",
     "test:integration": "INTEGRATION=1 bun test tests/integration.test.ts tests/openai-compat.test.ts",
     "test:all": "bun test tests/helpers.test.ts tests/api.test.ts tests/openai-compat.test.ts && INTEGRATION=1 bun test tests/integration.test.ts tests/openai-compat.test.ts",
@@ -44,15 +44,16 @@
     "proxy",
     "api",
     "claude-agent-sdk",
-    "llm"
+    "llm",
+    "openai-compatible"
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dylanneve1/claude-proxy.git"
+    "url": "git+https://github.com/dylanneve1/claude-sdk-proxy.git"
   },
-  "homepage": "https://github.com/dylanneve1/claude-proxy#readme",
+  "homepage": "https://github.com/dylanneve1/claude-sdk-proxy#readme",
   "bugs": {
-    "url": "https://github.com/dylanneve1/claude-proxy/issues"
+    "url": "https://github.com/dylanneve1/claude-sdk-proxy/issues"
   },
   "author": "dylanneve1",
   "license": "MIT",

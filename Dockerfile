@@ -18,5 +18,5 @@ EXPOSE 3456
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD curl -f http://127.0.0.1:3456/ || exit 1
 
-ENTRYPOINT ["bun", "run", "./bin/claude-proxy.ts"]
+ENTRYPOINT ["bun", "run", "./bin/claude-sdk-proxy.ts"]
 CMD ["--host", "0.0.0.0"]

@@ -1,11 +1,11 @@
-# claude-proxy
+# claude-sdk-proxy
 
 A drop-in Anthropic Messages API proxy backed by the **Claude Agent SDK**. Use your Claude Max subscription with any Anthropic API client — zero API cost.
 
 Also supports **OpenAI-compatible** endpoints so tools like LangChain, LiteLLM, and the OpenAI SDK work out of the box.
 
 ```
-Any Anthropic/OpenAI client → claude-proxy (:3456) → Claude Agent SDK → Claude Max
+Any Anthropic/OpenAI client → claude-sdk-proxy (:3456) → Claude Agent SDK → Claude Max
 ```
 
 ## Features
@@ -40,11 +40,11 @@ Any Anthropic/OpenAI client → claude-proxy (:3456) → Claude Agent SDK → Cl
 
 ```bash
 # From npm
-bunx claude-proxy
+bunx claude-sdk-proxy
 
 # Or clone and run
-git clone https://github.com/dylanneve1/claude-proxy
-cd claude-proxy
+git clone https://github.com/dylanneve1/claude-sdk-proxy
+cd claude-sdk-proxy
 bun install
 bun run proxy
 # Proxy listening at http://127.0.0.1:3456
@@ -55,7 +55,7 @@ bun run proxy
 ```bash
 docker compose up -d
 # or
-docker build -t claude-proxy . && docker run -p 3456:3456 -v ~/.claude:/root/.claude:ro claude-proxy
+docker build -t claude-sdk-proxy . && docker run -p 3456:3456 -v ~/.claude:/root/.claude:ro claude-sdk-proxy
 ```
 
 ## Usage Examples
@@ -167,7 +167,7 @@ All Anthropic endpoints are also available without the `/v1` prefix.
 ## CLI Options
 
 ```
-claude-proxy [options]
+claude-sdk-proxy [options]
 
   -p, --port <port>   Listen port (default: 3456, env: CLAUDE_PROXY_PORT)
   -H, --host <host>   Bind address (default: 127.0.0.1, env: CLAUDE_PROXY_HOST)
@@ -218,14 +218,14 @@ Expose the proxy as an HTTPS endpoint so you can use it from chat apps like Typi
 ### 1. Install & configure the proxy
 
 ```bash
-git clone https://github.com/dylanneve1/claude-proxy
-cd claude-proxy
+git clone https://github.com/dylanneve1/claude-sdk-proxy
+cd claude-sdk-proxy
 bun install
 ```
 
 ### 2. Set up systemd
 
-Create `~/.config/systemd/user/claude-proxy.service`:
+Create `~/.config/systemd/user/claude-sdk-proxy.service`:
 
 ```ini
 [Unit]
@@ -234,7 +234,7 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/path/to/claude-proxy
+WorkingDirectory=/path/to/claude-sdk-proxy
 ExecStart=/home/user/.bun/bin/bun run proxy
 Environment=PATH=/home/user/.bun/bin:/usr/local/bin:/usr/bin:/bin
 Environment=CLAUDE_PROXY_HOST=0.0.0.0
@@ -259,7 +259,7 @@ Enable and start:
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now claude-proxy
+systemctl --user enable --now claude-sdk-proxy
 ```
 
 ### 3. Add HTTPS with Caddy

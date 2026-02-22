@@ -1009,7 +1009,7 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}) {
     idleTimeout: 0
   })
 
-  console.log(`Claude Max Proxy v${PROXY_VERSION} running at http://${finalConfig.host}:${finalConfig.port}`)
+  console.log(`Claude SDK Proxy v${PROXY_VERSION} running at http://${finalConfig.host}:${finalConfig.port}`)
 
   // Graceful shutdown
   const shutdown = (signal: string) => {
