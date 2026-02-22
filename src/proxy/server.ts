@@ -594,31 +594,26 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               return
             }
 
-            // ── Agent mode: buffer turns, emit only the final turn ────────
-            // The SDK runs multi-turn with tools (maxTurns=50). Intermediate
-            // turns contain tool calls and reasoning that should NOT be sent
-            // to the client. We buffer each turn's text and only emit the
-            // final turn (the one without tool_use blocks).
+            // ── Agent mode: real-time streaming ─────────────────────────
+            // Forward text deltas to the client as they arrive from the SDK.
+            // For single-turn (most chat requests), this gives true token-by-
+            // token streaming. For multi-turn (agent tool use), the client
+            // sees all turns' text streamed in real-time.
             sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
 
-            let lastCleanTurnText = ""
-            let currentTurnText = ""
-            let currentTurnHasToolUse = false
+            let fullText = ""
+            let hasStreamed = false
             try {
               for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, systemPrompt, mcpState, abortController, maxThinkingTokens }) })) {
                 if (message.type === "stream_event") {
                   const ev = message.event as any
-                  if (ev.type === "message_start") {
-                    // New turn starting — save previous if it had no tool use
-                    if (currentTurnText && !currentTurnHasToolUse) {
-                      lastCleanTurnText = currentTurnText
+                  if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
+                    const text = ev.delta.text ?? ""
+                    if (text) {
+                      fullText += text
+                      hasStreamed = true
+                      sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })
                     }
-                    currentTurnText = ""
-                    currentTurnHasToolUse = false
-                  } else if (ev.type === "content_block_start" && ev.content_block?.type === "tool_use") {
-                    currentTurnHasToolUse = true
-                  } else if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
-                    currentTurnText += ev.delta.text ?? ""
                   }
                 }
               }
@@ -629,21 +624,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               releaseQueue()
             }
 
-            // Use the last turn if it had no tool use, otherwise use the last clean turn
-            const finalText = (!currentTurnHasToolUse && currentTurnText)
-              ? currentTurnText
-              : lastCleanTurnText
+            claudeLog("proxy.stream.done", { reqId, len: fullText.length, messageSent: mcpState.messageSent })
 
-            claudeLog("proxy.stream.done", { reqId, len: finalText.length, messageSent: mcpState.messageSent, turns: lastCleanTurnText ? "multi" : "single" })
-            const fullText = finalText
-
-            // Emit the buffered final text as a single delta
             if (mcpState.messageSent) {
-              // Messages were delivered via the MCP message tool — suppress
-              sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "NO_REPLY" } })
-            } else if (fullText && fullText.trim()) {
-              sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: fullText } })
-            } else {
+              sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "\nNO_REPLY" } })
+            } else if (!hasStreamed) {
               sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "..." } })
             }
 
@@ -858,9 +843,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       }
 
       // Forward to our own /v1/messages handler by making an internal request
+      const internalHeaders: Record<string, string> = { "Content-Type": "application/json" }
+      const authHeader = c.req.header("authorization") ?? c.req.header("x-api-key")
+      if (authHeader) {
+        if (c.req.header("authorization")) internalHeaders["authorization"] = authHeader
+        else internalHeaders["x-api-key"] = authHeader
+      }
       const internalRes = await app.fetch(new Request(`http://localhost/v1/messages`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: internalHeaders,
         body: JSON.stringify(anthropicBody)
       }))
 
