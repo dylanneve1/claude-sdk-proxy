@@ -27,7 +27,7 @@ describe("GET /", () => {
     const { status, body } = await json("/")
     expect(status).toBe(200)
     expect(body.status).toBe("ok")
-    expect(body.service).toBe("claude-max-proxy")
+    expect(body.service).toBe("claude-sdk-proxy")
     expect(body.version).toBeDefined()
     expect(body.format).toBe("anthropic")
     expect(body.endpoints).toBeArray()
@@ -225,7 +225,7 @@ describe("Request ID", () => {
 describe("Anthropic headers", () => {
   test("includes anthropic-version header", async () => {
     const res = await req("/")
-    expect(res.headers.get("anthropic-version")).toBe("2024-10-22")
+    expect(res.headers.get("anthropic-version")).toBe("2023-06-01")
   })
 
   test("echoes back anthropic-beta header", async () => {
