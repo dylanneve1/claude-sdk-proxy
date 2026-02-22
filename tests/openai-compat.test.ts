@@ -173,7 +173,7 @@ describe("Integration: OpenAI non-streaming", () => {
 })
 
 describe("Integration: OpenAI streaming", () => {
-  test("streams chat completion chunks", async () => {
+  test("streams chat completion chunks with role delta", async () => {
     if (skipUnlessIntegration()) return
     const res = await fetch(`${PROXY_URL}/v1/chat/completions`, {
       method: "POST",
@@ -188,22 +188,55 @@ describe("Integration: OpenAI streaming", () => {
     const lines = text.split("\n").filter(l => l.startsWith("data: "))
     expect(lines.length).toBeGreaterThan(0)
 
-    // Check for content chunks
-    const contentChunks = lines.filter(l => {
-      if (l === "data: [DONE]") return false
-      try {
-        const data = JSON.parse(l.slice(6))
-        return data.choices?.[0]?.delta?.content
-      } catch { return false }
-    })
+    // Parse all chunks
+    const chunks = lines
+      .filter(l => l !== "data: [DONE]")
+      .map(l => { try { return JSON.parse(l.slice(6)) } catch { return null } })
+      .filter(Boolean)
+
+    // First chunk should have role: "assistant" in delta
+    const roleChunk = chunks.find((c: any) => c.choices?.[0]?.delta?.role === "assistant")
+    expect(roleChunk).toBeDefined()
+    expect(roleChunk.object).toBe("chat.completion.chunk")
+
+    // Should have content chunks
+    const contentChunks = chunks.filter((c: any) => c.choices?.[0]?.delta?.content)
     expect(contentChunks.length).toBeGreaterThan(0)
 
     // Check for [DONE] terminator
     expect(lines.some(l => l === "data: [DONE]")).toBe(true)
 
-    // Check format of a chunk
-    const firstChunk = JSON.parse(contentChunks[0]!.slice(6))
-    expect(firstChunk.object).toBe("chat.completion.chunk")
-    expect(firstChunk.model).toBe("claude-sonnet-4-6")
+    // Final chunk should have finish_reason: "stop"
+    const finishChunk = chunks.find((c: any) => c.choices?.[0]?.finish_reason === "stop")
+    expect(finishChunk).toBeDefined()
+
+    // Consistent chat ID across chunks
+    const ids = new Set(chunks.map((c: any) => c.id))
+    expect(ids.size).toBe(1)
+  }, 120_000)
+
+  test("stream_options.include_usage returns usage in final chunk", async () => {
+    if (skipUnlessIntegration()) return
+    const res = await fetch(`${PROXY_URL}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        messages: [{ role: "user", content: "Say hello." }],
+        stream: true,
+        stream_options: { include_usage: true }
+      })
+    })
+    const text = await res.text()
+    const lines = text.split("\n").filter(l => l.startsWith("data: ") && l !== "data: [DONE]")
+    const chunks = lines.map(l => { try { return JSON.parse(l.slice(6)) } catch { return null } }).filter(Boolean)
+
+    // Final chunk with finish_reason should include usage
+    const finishChunk = chunks.find((c: any) => c.choices?.[0]?.finish_reason)
+    expect(finishChunk).toBeDefined()
+    expect(finishChunk.usage).toBeDefined()
+    expect(finishChunk.usage.prompt_tokens).toBeGreaterThanOrEqual(0)
+    expect(finishChunk.usage.completion_tokens).toBeGreaterThanOrEqual(0)
+    expect(finishChunk.usage.total_tokens).toBe(finishChunk.usage.prompt_tokens + finishChunk.usage.completion_tokens)
   }, 120_000)
 })

@@ -118,7 +118,8 @@ function serializeBlock(block: any, tempFiles: string[]): string {
       return imgPath ? `[Image: ${imgPath}]` : "[Image: (unable to save)]"
     }
     case "tool_use":
-      return `[Tool call: ${block.name}\nInput: ${JSON.stringify(block.input ?? {}, null, 2)}]`
+      // Use <tool_use> XML format so the model continues using parseable blocks
+      return `<tool_use>\n{"name": "${block.name}", "input": ${JSON.stringify(block.input ?? {})}}\n</tool_use>`
     case "tool_result": {
       const content = Array.isArray(block.content)
         ? block.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("")
@@ -126,7 +127,7 @@ function serializeBlock(block: any, tempFiles: string[]): string {
       const truncated = content.length > 4000
         ? content.slice(0, 4000) + `\n...[truncated ${content.length - 4000} chars]`
         : content
-      return `[Tool result (id=${block.tool_use_id}): ${truncated}]`
+      return `<tool_result tool_use_id="${block.tool_use_id}">\n${truncated}\n</tool_result>`
     }
     case "thinking":
       return ""
@@ -185,11 +186,13 @@ function buildClientToolsPrompt(tools: any[]): string {
 interface ToolCall { id: string; name: string; input: unknown }
 
 function parseToolUse(text: string): { toolCalls: ToolCall[]; textBefore: string } {
-  const regex = /<tool_use>([\s\S]*?)<\/tool_use>/g
   const calls: ToolCall[] = []
   let firstIdx = -1
+
+  // Parse <tool_use> XML blocks (primary format)
+  const xmlRegex = /<tool_use>([\s\S]*?)<\/tool_use>/g
   let m: RegExpExecArray | null
-  while ((m = regex.exec(text)) !== null) {
+  while ((m = xmlRegex.exec(text)) !== null) {
     if (firstIdx < 0) firstIdx = m.index
     try {
       const p = JSON.parse(m[1]!.trim())
@@ -200,6 +203,23 @@ function parseToolUse(text: string): { toolCalls: ToolCall[]; textBefore: string
       })
     } catch { /* skip malformed block */ }
   }
+
+  // Fallback: parse [Tool call: name\nInput: {...}] format
+  if (calls.length === 0) {
+    const bracketRegex = /\[Tool call:\s*(\w+)\s*\nInput:\s*([\s\S]*?)\]/g
+    while ((m = bracketRegex.exec(text)) !== null) {
+      if (firstIdx < 0) firstIdx = m.index
+      try {
+        const input = JSON.parse(m[2]!.trim())
+        calls.push({
+          id: `toolu_${randomBytes(16).toString("hex")}`,
+          name: m[1]!.trim(),
+          input
+        })
+      } catch { /* skip malformed block */ }
+    }
+  }
+
   return { toolCalls: calls, textBefore: firstIdx > 0 ? text.slice(0, firstIdx).trim() : "" }
 }
 
@@ -214,7 +234,7 @@ function buildQueryOptions(
   opts: {
     partial?: boolean
     clientToolMode?: boolean
-    clientSystemPrompt?: string
+    systemPrompt?: string
     mcpState?: McpServerState
     abortController?: AbortController
     maxThinkingTokens?: number
@@ -230,17 +250,17 @@ function buildQueryOptions(
     ...(opts.partial ? { includePartialMessages: true } : {}),
     ...(opts.abortController ? { abortController: opts.abortController } : {}),
     ...(opts.maxThinkingTokens ? { maxThinkingTokens: opts.maxThinkingTokens } : {}),
+    ...(opts.systemPrompt ? { systemPrompt: opts.systemPrompt } : {}),
     disallowedTools: [...BLOCKED_BUILTIN_TOOLS],
   }
 
   if (opts.clientToolMode) {
     // Disable ALL built-in tools — the caller manages its own tool loop.
-    // Inject tool definitions via systemPrompt so Claude respects them.
+    // Tool definitions are already baked into the systemPrompt.
     return {
       ...base,
       maxTurns: 1,
       tools: [] as string[],
-      ...(opts.clientSystemPrompt ? { systemPrompt: opts.clientSystemPrompt } : {}),
     }
   }
 
@@ -393,39 +413,70 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         }
       }
 
-      const conversationParts = body.messages
-        ?.map((m: { role: string; content: string | Array<any> }) => {
-          const role = m.role === "assistant" ? "Assistant" : "Human"
-          return `${role}: ${serializeContent(m.content, tempFiles)}`
-        })
-        .join("\n\n") || ""
+      // Build the prompt from messages. The SDK's query() takes a single prompt
+      // string. To avoid the model continuing a "Human:/Assistant:" format in its
+      // response, we use neutral delimiters and only the last user message as the
+      // primary prompt when there's minimal context.
+      const messages = body.messages as Array<{ role: string; content: string | Array<any> }>
 
-      // Client tool mode: put system+tools into SDK systemPrompt, conversation as prompt.
-      // Agent mode: pass system + conversation as prompt text, no injected notes.
       let prompt: string
-      let clientSystemPrompt: string | undefined
+      let systemPrompt: string | undefined
+
       if (clientToolMode) {
+        // Client tool mode: serialize all messages as context, inject tools
+        const conversationParts = messages
+          .map((m) => {
+            const label = m.role === "assistant" ? "[assistant]" : "[user]"
+            return `${label}\n${serializeContent(m.content, tempFiles)}`
+          })
+          .join("\n\n")
         const toolsSection = buildClientToolsPrompt(body.tools)
-        clientSystemPrompt = systemContext
+        systemPrompt = systemContext
           ? `${systemContext}${toolsSection}`
           : toolsSection
         prompt = conversationParts
+      } else if (messages.length === 1) {
+        // Single message: pass directly as prompt (most common case)
+        systemPrompt = systemContext || undefined
+        prompt = serializeContent(messages[0]!.content, tempFiles)
       } else {
-        prompt = systemContext
-          ? `${systemContext}\n\n${conversationParts}`
-          : conversationParts
+        // Multi-turn: build conversation context with neutral delimiters.
+        // Put prior turns in system prompt as context, last user message as prompt.
+        const lastMsg = messages[messages.length - 1]!
+        const priorMsgs = messages.slice(0, -1)
+
+        const contextParts = priorMsgs
+          .map((m) => {
+            const label = m.role === "assistant" ? "[assistant]" : "[user]"
+            return `${label}\n${serializeContent(m.content, tempFiles)}`
+          })
+          .join("\n\n")
+
+        const baseSystem = systemContext || ""
+        const contextSection = contextParts
+          ? `\n\n<conversation_history>\n${contextParts}\n</conversation_history>`
+          : ""
+        systemPrompt = (baseSystem + contextSection).trim() || undefined
+        prompt = serializeContent(lastMsg.content, tempFiles)
       }
 
       // ── Non-streaming ──────────────────────────────────────────────────────
       if (!stream) {
         let fullText = ""
+        let lastCleanText = ""
         try {
-          for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: false, clientToolMode, clientSystemPrompt, mcpState, abortController, maxThinkingTokens }) })) {
+          for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: false, clientToolMode, systemPrompt, mcpState, abortController, maxThinkingTokens }) })) {
             if (message.type === "assistant") {
-              fullText = ""
+              let turnText = ""
+              let hasToolUse = false
               for (const block of message.message.content) {
-                if (block.type === "text") fullText += block.text
+                if (block.type === "text") turnText += block.text
+                if (block.type === "tool_use") hasToolUse = true
               }
+              if (!hasToolUse && turnText) {
+                lastCleanText = turnText
+              }
+              fullText = turnText
             }
           }
         } finally {
@@ -433,6 +484,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
           cleanupTempFiles(tempFiles)
           requestQueue.release()
         }
+        // In agent mode, prefer the last turn that had no tool_use
+        if (!clientToolMode && lastCleanText) fullText = lastCleanText
 
         if (clientToolMode) {
           const { toolCalls, textBefore } = parseToolUse(fullText)
@@ -496,7 +549,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             if (clientToolMode) {
               let fullText = ""
               try {
-                for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, clientToolMode: true, clientSystemPrompt, abortController, maxThinkingTokens }) })) {
+                for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, clientToolMode: true, systemPrompt, abortController, maxThinkingTokens }) })) {
                   if (message.type === "stream_event") {
                     const ev = message.event as any
                     if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
@@ -541,20 +594,31 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               return
             }
 
-            // ── Agent mode: stream text deltas in real-time ───────────────
+            // ── Agent mode: buffer turns, emit only the final turn ────────
+            // The SDK runs multi-turn with tools (maxTurns=50). Intermediate
+            // turns contain tool calls and reasoning that should NOT be sent
+            // to the client. We buffer each turn's text and only emit the
+            // final turn (the one without tool_use blocks).
             sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
 
-            let fullText = ""
+            let lastCleanTurnText = ""
+            let currentTurnText = ""
+            let currentTurnHasToolUse = false
             try {
-              for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, mcpState, abortController, maxThinkingTokens }) })) {
+              for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, systemPrompt, mcpState, abortController, maxThinkingTokens }) })) {
                 if (message.type === "stream_event") {
                   const ev = message.event as any
-                  if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
-                    const chunk = ev.delta.text ?? ""
-                    if (chunk) {
-                      fullText += chunk
-                      sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: chunk } })
+                  if (ev.type === "message_start") {
+                    // New turn starting — save previous if it had no tool use
+                    if (currentTurnText && !currentTurnHasToolUse) {
+                      lastCleanTurnText = currentTurnText
                     }
+                    currentTurnText = ""
+                    currentTurnHasToolUse = false
+                  } else if (ev.type === "content_block_start" && ev.content_block?.type === "tool_use") {
+                    currentTurnHasToolUse = true
+                  } else if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
+                    currentTurnText += ev.delta.text ?? ""
                   }
                 }
               }
@@ -565,13 +629,21 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               releaseQueue()
             }
 
-            claudeLog("proxy.stream.done", { reqId, len: fullText.length, messageSent: mcpState.messageSent })
+            // Use the last turn if it had no tool use, otherwise use the last clean turn
+            const finalText = (!currentTurnHasToolUse && currentTurnText)
+              ? currentTurnText
+              : lastCleanTurnText
 
-            // Auto-suppress: if messages were delivered via the MCP message tool,
-            // append NO_REPLY so the client knows not to double-deliver.
-            if (mcpState.messageSent && !fullText.trimEnd().endsWith("NO_REPLY")) {
-              sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "\nNO_REPLY" } })
-            } else if (!fullText || !fullText.trim()) {
+            claudeLog("proxy.stream.done", { reqId, len: finalText.length, messageSent: mcpState.messageSent, turns: lastCleanTurnText ? "multi" : "single" })
+            const fullText = finalText
+
+            // Emit the buffered final text as a single delta
+            if (mcpState.messageSent) {
+              // Messages were delivered via the MCP message tool — suppress
+              sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "NO_REPLY" } })
+            } else if (fullText && fullText.trim()) {
+              sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: fullText } })
+            } else {
               sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "..." } })
             }
 
@@ -801,6 +873,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       }
 
       // Streaming: translate SSE events from Anthropic format to OpenAI format
+      const includeUsage = body.stream_options?.include_usage === true
       const encoder = new TextEncoder()
       const readable = new ReadableStream({
         async start(controller) {
@@ -810,6 +883,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
             const decoder = new TextDecoder()
             let buffer = ""
+            const chatId = `chatcmpl-${Date.now()}`
+            const created = Math.floor(Date.now() / 1000)
+            let sentRole = false
+            let finishReason: string | null = null
+            // Track active tool calls for streaming
+            const activeToolCalls: Map<number, { id: string; name: string; argBuffer: string }> = new Map()
+            let toolCallIndex = 0
+            let usageInfo: { input_tokens: number; output_tokens: number } | null = null
 
             while (true) {
               const { done, value } = await reader.read()
@@ -824,32 +905,65 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 try {
                   const event = JSON.parse(line.slice(6))
 
-                  if (event.type === "content_block_delta" && event.delta?.type === "text_delta") {
-                    const chunk = {
-                      id: `chatcmpl-${Date.now()}`,
-                      object: "chat.completion.chunk",
-                      created: Math.floor(Date.now() / 1000),
-                      model: requestedModel,
-                      choices: [{
-                        index: 0,
-                        delta: { content: event.delta.text },
-                        finish_reason: null
-                      }]
+                  // Emit role delta on first event
+                  if (!sentRole && (event.type === "content_block_start" || event.type === "content_block_delta")) {
+                    sentRole = true
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                      id: chatId, object: "chat.completion.chunk", created, model: requestedModel,
+                      choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]
+                    })}\n\n`))
+                  }
+
+                  if (event.type === "content_block_start" && event.content_block?.type === "tool_use") {
+                    // Start of a tool_use block → emit tool_call function header
+                    const idx = toolCallIndex++
+                    activeToolCalls.set(event.index, { id: event.content_block.id, name: event.content_block.name, argBuffer: "" })
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                      id: chatId, object: "chat.completion.chunk", created, model: requestedModel,
+                      choices: [{ index: 0, delta: {
+                        tool_calls: [{ index: idx, id: event.content_block.id, type: "function", function: { name: event.content_block.name, arguments: "" } }]
+                      }, finish_reason: null }]
+                    })}\n\n`))
+                  } else if (event.type === "content_block_delta" && event.delta?.type === "input_json_delta") {
+                    // Tool call argument streaming
+                    const tc = activeToolCalls.get(event.index)
+                    if (tc) {
+                      const idx = Array.from(activeToolCalls.keys()).indexOf(event.index)
+                      controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                        id: chatId, object: "chat.completion.chunk", created, model: requestedModel,
+                        choices: [{ index: 0, delta: {
+                          tool_calls: [{ index: idx, function: { arguments: event.delta.partial_json } }]
+                        }, finish_reason: null }]
+                      })}\n\n`))
                     }
-                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
+                  } else if (event.type === "content_block_delta" && event.delta?.type === "text_delta") {
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                      id: chatId, object: "chat.completion.chunk", created, model: requestedModel,
+                      choices: [{ index: 0, delta: { content: event.delta.text }, finish_reason: null }]
+                    })}\n\n`))
+                  } else if (event.type === "message_delta") {
+                    // Capture finish reason and usage for final chunk
+                    const sr = event.delta?.stop_reason
+                    finishReason = sr === "tool_use" ? "tool_calls" : sr === "max_tokens" ? "length" : "stop"
+                    if (event.usage) {
+                      usageInfo = { input_tokens: event.usage.input_tokens ?? 0, output_tokens: event.usage.output_tokens ?? 0 }
+                    }
+                  } else if (event.type === "message_start" && event.message?.usage) {
+                    // Capture input token count from message_start
+                    usageInfo = { input_tokens: event.message.usage.input_tokens ?? 0, output_tokens: 0 }
                   } else if (event.type === "message_stop") {
-                    const chunk = {
-                      id: `chatcmpl-${Date.now()}`,
-                      object: "chat.completion.chunk",
-                      created: Math.floor(Date.now() / 1000),
-                      model: requestedModel,
-                      choices: [{
-                        index: 0,
-                        delta: {},
-                        finish_reason: "stop"
-                      }]
+                    const finalChunk: any = {
+                      id: chatId, object: "chat.completion.chunk", created, model: requestedModel,
+                      choices: [{ index: 0, delta: {}, finish_reason: finishReason ?? "stop" }]
                     }
-                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
+                    if (includeUsage && usageInfo) {
+                      finalChunk.usage = {
+                        prompt_tokens: usageInfo.input_tokens,
+                        completion_tokens: usageInfo.output_tokens,
+                        total_tokens: usageInfo.input_tokens + usageInfo.output_tokens
+                      }
+                    }
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(finalChunk)}\n\n`))
                     controller.enqueue(encoder.encode("data: [DONE]\n\n"))
                   }
                 } catch {}

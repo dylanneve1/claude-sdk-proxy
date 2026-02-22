@@ -184,6 +184,7 @@ claude-proxy [options]
 | `CLAUDE_PROXY_HOST` | `127.0.0.1` | Proxy bind address |
 | `CLAUDE_PROXY_DEBUG` | unset | Enable debug logging (`1` to enable) |
 | `CLAUDE_PROXY_API_KEY` | unset | When set, require this key via `x-api-key` or `Authorization: Bearer` header |
+| `CLAUDE_PROXY_MAX_CONCURRENT` | `5` | Max simultaneous Claude SDK sessions |
 | `CLAUDE_PROXY_TIMEOUT_MS` | `300000` | Per-request timeout in milliseconds |
 
 ## Testing
