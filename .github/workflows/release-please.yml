@@ -43,7 +43,7 @@ jobs:
         run: bun run typecheck
 
       - name: Unit tests
-        run: bun test tests/helpers.test.ts tests/api.test.ts
+        run: bun test tests/helpers.test.ts tests/api.test.ts tests/openai-compat.test.ts
 
       - name: Publish to npm
         run: npm publish --provenance --access public
