@@ -4,13 +4,15 @@ import { query } from "@anthropic-ai/claude-agent-sdk"
 import type { Context } from "hono"
 import type { ProxyConfig } from "./types"
 import { DEFAULT_PROXY_CONFIG } from "./types"
-import { claudeLog } from "../logger"
+import { logInfo, logWarn, logError, logDebug, LOG_DIR } from "../logger"
+import { traceStore } from "../trace"
 import { execSync } from "child_process"
-import { existsSync, writeFileSync, unlinkSync, readFileSync } from "fs"
+import { existsSync, writeFileSync, unlinkSync, readFileSync, readdirSync } from "fs"
 import { tmpdir } from "os"
 import { randomBytes } from "crypto"
 import { fileURLToPath } from "url"
 import { join, dirname } from "path"
+
 // Base62 ID generator — matches Anthropic's real ID format (e.g. msg_01XFDUDYJgAACzvnptvVoYEL)
 const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 function generateId(prefix: string, length = 24): string {
@@ -47,9 +49,11 @@ const claudeExecutable = resolveClaudeExecutable()
 
 const MAX_CONCURRENT = parseInt(process.env.CLAUDE_PROXY_MAX_CONCURRENT ?? "5", 10)
 
+const QUEUE_TIMEOUT_MS = parseInt(process.env.CLAUDE_PROXY_QUEUE_TIMEOUT_MS ?? "30000", 10)
+
 class RequestQueue {
   private active = 0
-  private waiting: Array<() => void> = []
+  private waiting: Array<{ resolve: () => void; reject: (err: Error) => void }> = []
 
   get activeCount() { return this.active }
   get waitingCount() { return this.waiting.length }
@@ -59,15 +63,25 @@ class RequestQueue {
       this.active++
       return
     }
-    return new Promise<void>((resolve) => {
-      this.waiting.push(() => { this.active++; resolve() })
+    return new Promise<void>((resolve, reject) => {
+      const entry = { resolve: () => { this.active++; resolve() }, reject }
+      this.waiting.push(entry)
+      const timer = setTimeout(() => {
+        const idx = this.waiting.indexOf(entry)
+        if (idx !== -1) {
+          this.waiting.splice(idx, 1)
+          reject(new Error("Queue timeout — all slots busy"))
+        }
+      }, QUEUE_TIMEOUT_MS)
+      const origResolve = entry.resolve
+      entry.resolve = () => { clearTimeout(timer); origResolve() }
     })
   }
 
   release(): void {
     this.active--
     const next = this.waiting.shift()
-    if (next) next()
+    if (next) next.resolve()
   }
 }
 
@@ -119,7 +133,6 @@ function serializeBlock(block: any, tempFiles: string[]): string {
       return imgPath ? `[Image: ${imgPath}]` : "[Image: (unable to save)]"
     }
     case "tool_use":
-      // Use <tool_use> XML format so the model continues using parseable blocks
       return `<tool_use>\n{"name": "${block.name}", "input": ${JSON.stringify(block.input ?? {})}}\n</tool_use>`
     case "tool_result": {
       const content = Array.isArray(block.content)
@@ -128,7 +141,7 @@ function serializeBlock(block: any, tempFiles: string[]): string {
       const truncated = content.length > 4000
         ? content.slice(0, 4000) + `\n...[truncated ${content.length - 4000} chars]`
         : content
-      return `<tool_result tool_use_id="${block.tool_use_id}">\n${truncated}\n</tool_result>`
+      return `[Tool Result (id: ${block.tool_use_id})]\n${truncated}\n[/Tool Result]`
     }
     case "thinking":
       return ""
@@ -150,9 +163,6 @@ function cleanupTempFiles(tempFiles: string[]) {
 }
 
 // ── Client tool-use support ──────────────────────────────────────────────────
-// The proxy never uses Claude Code's built-in tools. All tools come from the
-// API caller. Tool definitions are injected into the system prompt; <tool_use>
-// XML blocks in the output are parsed back into Anthropic tool_use content.
 
 function buildClientToolsPrompt(tools: any[]): string {
   const defs = tools.map((t: any) => {
@@ -173,7 +183,6 @@ function parseToolUse(text: string): { toolCalls: ToolCall[]; textBefore: string
   const calls: ToolCall[] = []
   let firstIdx = -1
 
-  // Parse <tool_use> XML blocks (primary format)
   const xmlRegex = /<tool_use>([\s\S]*?)<\/tool_use>/g
   let m: RegExpExecArray | null
   while ((m = xmlRegex.exec(text)) !== null) {
@@ -188,7 +197,43 @@ function parseToolUse(text: string): { toolCalls: ToolCall[]; textBefore: string
     } catch { /* skip malformed block */ }
   }
 
-  // Fallback: parse [Tool call: name\nInput: {...}] format
+  if (calls.length === 0) {
+    const fcRegex = /<function_calls>([\s\S]*?)<\/function_calls>/g
+    while ((m = fcRegex.exec(text)) !== null) {
+      if (firstIdx < 0) firstIdx = m.index
+      try {
+        const parsed = JSON.parse(m[1]!.trim())
+        const items = Array.isArray(parsed) ? parsed : [parsed]
+        for (const p of items) {
+          if (p && typeof p.name === "string") {
+            calls.push({
+              id: generateId("toolu_"),
+              name: p.name,
+              input: p.input ?? p.parameters ?? {}
+            })
+          }
+        }
+      } catch { /* skip malformed block */ }
+    }
+  }
+
+  if (calls.length === 0) {
+    const invokeRegex = /<invoke\s+name="([^"]+)">([\s\S]*?)<\/invoke>/g
+    while ((m = invokeRegex.exec(text)) !== null) {
+      if (firstIdx < 0) firstIdx = m.index
+      const toolName = m[1]!
+      const body = m[2]!
+      const input: Record<string, any> = {}
+      const paramRegex = /<parameter\s+name="([^"]+)">([\s\S]*?)<\/parameter>/g
+      let pm: RegExpExecArray | null
+      while ((pm = paramRegex.exec(body)) !== null) {
+        const val = pm[2]!.trim()
+        try { input[pm[1]!] = JSON.parse(val) } catch { input[pm[1]!] = val }
+      }
+      calls.push({ id: generateId("toolu_"), name: toolName, input })
+    }
+  }
+
   if (calls.length === 0) {
     const bracketRegex = /\[Tool call:\s*(\w+)\s*\nInput:\s*([\s\S]*?)\]/g
     while ((m = bracketRegex.exec(text)) !== null) {
@@ -212,9 +257,6 @@ function roughTokens(text: string): number {
 }
 
 // ── Query options builder ────────────────────────────────────────────────────
-// Always runs with all built-in tools disabled (tools: []) and maxTurns: 1.
-// The proxy is a pure API translation layer — tool definitions come from the
-// caller and are injected into the system prompt. No MCP servers, no agent loop.
 
 function buildQueryOptions(
   model: "sonnet" | "opus" | "haiku",
@@ -232,7 +274,7 @@ function buildQueryOptions(
     allowDangerouslySkipPermissions: true,
     persistSession: false,
     settingSources: [],
-    tools: [] as string[],
+    tools: ["_proxy_noop_"] as string[],
     maxTurns: 1,
     ...(opts.partial ? { includePartialMessages: true } : {}),
     ...(opts.abortController ? { abortController: opts.abortController } : {}),
@@ -249,13 +291,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
   app.use("*", cors())
 
-  // Optional API key validation — when CLAUDE_PROXY_API_KEY is set,
-  // require a matching x-api-key or Authorization: Bearer header.
+  // Optional API key validation
   const requiredApiKey = process.env.CLAUDE_PROXY_API_KEY
   if (requiredApiKey) {
     app.use("*", async (c, next) => {
-      // Skip auth for health check and OPTIONS
-      if (c.req.path === "/" || c.req.method === "OPTIONS") return next()
+      if (c.req.path === "/" || c.req.path.startsWith("/debug") || c.req.method === "OPTIONS") return next()
       const key = c.req.header("x-api-key")
         ?? c.req.header("authorization")?.replace(/^Bearer\s+/i, "")
       if (key !== requiredApiKey) {
@@ -269,29 +309,158 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
     })
   }
 
-  // Anthropic-compatible headers + request logging
+  // Anthropic-compatible headers + HTTP request logging
   app.use("*", async (c, next) => {
     const start = Date.now()
     const requestId = c.req.header("x-request-id") ?? generateId("req_")
     c.header("x-request-id", requestId)
     c.header("request-id", requestId)
-    // Echo back Anthropic-standard headers
     c.header("anthropic-version", "2023-06-01")
     const betaHeader = c.req.header("anthropic-beta")
     if (betaHeader) c.header("anthropic-beta", betaHeader)
     await next()
     const ms = Date.now() - start
-    claudeLog("proxy.http", { method: c.req.method, path: c.req.path, status: c.res.status, ms, requestId })
+    // Only log non-debug HTTP requests at info level; debug endpoints at debug level
+    if (c.req.path.startsWith("/debug")) {
+      logDebug("http.request", { method: c.req.method, path: c.req.path, status: c.res.status, ms, reqId: requestId })
+    } else {
+      logInfo("http.request", { method: c.req.method, path: c.req.path, status: c.res.status, ms, reqId: requestId })
+    }
   })
+
+  // ── Health / Info ────────────────────────────────────────────────────────
 
   app.get("/", (c) => c.json({
     status: "ok",
     service: "claude-sdk-proxy",
     version: PROXY_VERSION,
     format: "anthropic",
-    endpoints: ["/v1/messages", "/v1/models", "/v1/chat/completions"],
-    queue: { active: requestQueue.activeCount, waiting: requestQueue.waitingCount, max: MAX_CONCURRENT }
+    endpoints: ["/v1/messages", "/v1/models", "/v1/chat/completions", "/debug/stats", "/debug/traces", "/debug/errors", "/debug/active", "/debug/health"],
+    queue: { active: requestQueue.activeCount, waiting: requestQueue.waitingCount, max: MAX_CONCURRENT },
+    logDir: LOG_DIR,
   }))
+
+  // ── Debug / Observability endpoints ──────────────────────────────────────
+
+  app.get("/debug/stats", (c) => {
+    const stats = traceStore.getStats()
+    return c.json({
+      version: PROXY_VERSION,
+      config: {
+        stallTimeoutMs: finalConfig.stallTimeoutMs,
+        maxDurationMs: finalConfig.maxDurationMs,
+        maxOutputChars: finalConfig.maxOutputChars,
+        maxConcurrent: MAX_CONCURRENT,
+        queueTimeoutMs: QUEUE_TIMEOUT_MS,
+        claudeExecutable,
+        logDir: LOG_DIR,
+        debug: finalConfig.debug,
+      },
+      queue: { active: requestQueue.activeCount, waiting: requestQueue.waitingCount, max: MAX_CONCURRENT },
+      ...stats,
+    })
+  })
+
+  app.get("/debug/traces", (c) => {
+    const limit = parseInt(c.req.query("limit") ?? "20", 10)
+    return c.json(traceStore.getRecentTraces(limit))
+  })
+
+  app.get("/debug/traces/:id", (c) => {
+    const id = c.req.param("id")
+    const trace = traceStore.getTrace(id)
+    if (!trace) return c.json({ error: "Trace not found", reqId: id }, 404)
+    return c.json(trace)
+  })
+
+  app.get("/debug/errors", (c) => {
+    const limit = parseInt(c.req.query("limit") ?? "10", 10)
+    return c.json(traceStore.getRecentErrors(limit))
+  })
+
+  app.get("/debug/logs", (c) => {
+    // List available log files
+    try {
+      const files = readdirSync(LOG_DIR)
+        .filter(f => f.startsWith("proxy-") && f.endsWith(".log"))
+        .sort()
+        .reverse()
+      return c.json({ logDir: LOG_DIR, files })
+    } catch {
+      return c.json({ logDir: LOG_DIR, files: [], error: "Cannot read log directory" })
+    }
+  })
+
+  app.get("/debug/logs/:filename", (c) => {
+    // Serve a specific log file (last N lines)
+    const filename = c.req.param("filename")
+    if (!filename.match(/^proxy-\d{4}-\d{2}-\d{2}\.log$/)) {
+      return c.json({ error: "Invalid log filename" }, 400)
+    }
+    const tail = parseInt(c.req.query("tail") ?? "100", 10)
+    try {
+      const content = readFileSync(join(LOG_DIR, filename), "utf-8")
+      const lines = content.trim().split("\n")
+      const sliced = lines.slice(-tail)
+      const parsed = sliced.map(line => {
+        try { return JSON.parse(line) } catch { return { raw: line } }
+      })
+      return c.json({ file: filename, total: lines.length, returned: sliced.length, lines: parsed })
+    } catch {
+      return c.json({ error: "Log file not found" }, 404)
+    }
+  })
+
+  app.get("/debug/errors/:id", (c) => {
+    // Serve a specific error dump file
+    const id = c.req.param("id")
+    if (!id.match(/^req_/)) return c.json({ error: "Invalid request ID format" }, 400)
+    try {
+      const content = readFileSync(join(LOG_DIR, "errors", `${id}.json`), "utf-8")
+      return c.json(JSON.parse(content))
+    } catch {
+      return c.json({ error: "Error dump not found", reqId: id }, 404)
+    }
+  })
+
+  app.get("/debug/active", (c) => {
+    // Detailed view of currently active requests
+    const stats = traceStore.getStats()
+    return c.json({
+      queue: { active: requestQueue.activeCount, waiting: requestQueue.waitingCount, max: MAX_CONCURRENT },
+      activeRequests: stats.activeRequests,
+    })
+  })
+
+  app.get("/debug/health", (c) => {
+    // Process health: memory, uptime, resource usage
+    const mem = process.memoryUsage()
+    const stats = traceStore.getStats()
+    return c.json({
+      version: PROXY_VERSION,
+      pid: process.pid,
+      uptimeMs: stats.uptimeMs,
+      uptimeHuman: stats.uptimeHuman,
+      memory: {
+        rss: `${(mem.rss / 1024 / 1024).toFixed(1)}MB`,
+        heapUsed: `${(mem.heapUsed / 1024 / 1024).toFixed(1)}MB`,
+        heapTotal: `${(mem.heapTotal / 1024 / 1024).toFixed(1)}MB`,
+        external: `${(mem.external / 1024 / 1024).toFixed(1)}MB`,
+        rssBytes: mem.rss,
+        heapUsedBytes: mem.heapUsed,
+      },
+      queue: { active: requestQueue.activeCount, waiting: requestQueue.waitingCount, max: MAX_CONCURRENT },
+      requests: stats.requests,
+      config: {
+        stallTimeoutMs: finalConfig.stallTimeoutMs,
+        maxConcurrent: MAX_CONCURRENT,
+        queueTimeoutMs: QUEUE_TIMEOUT_MS,
+        debug: finalConfig.debug,
+      },
+    })
+  })
+
+  // ── Model endpoints ──────────────────────────────────────────────────────
 
   const MODELS = [
     { type: "model", id: "claude-opus-4-6",              display_name: "Claude Opus 4.6",    created_at: "2025-08-01T00:00:00Z" },
@@ -303,7 +472,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
     { type: "model", id: "claude-haiku-4-5-20251001",    display_name: "Claude Haiku 4.5",   created_at: "2025-10-01T00:00:00Z" },
   ]
 
-  // Dual-format model data: includes fields for both Anthropic and OpenAI SDKs
   const MODELS_DUAL = MODELS.map(m => ({
     ...m,
     object: "model" as const,
@@ -341,17 +509,27 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
   app.post("/v1/messages/count_tokens", handleCountTokens)
   app.post("/messages/count_tokens", handleCountTokens)
 
+  // ── Messages handler ─────────────────────────────────────────────────────
+
   const handleMessages = async (c: Context) => {
     const reqId = generateId("req_")
+    // Will be set after body parse; needed for outer catch
+    let trace: ReturnType<typeof traceStore.create> | undefined
+    let requestStarted = Date.now()
+    let clientDisconnected = false
+    let abortReason: "stall" | "max_duration" | "max_output" | null = null
+
     try {
       let body: any
       try {
         body = await c.req.json()
-      } catch {
+      } catch (parseErr) {
+        logWarn("request.invalid_json", { reqId })
         return c.json({ type: "error", error: { type: "invalid_request_error", message: "Request body must be valid JSON" }, request_id: reqId }, 400)
       }
 
       if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
+        logWarn("request.missing_messages", { reqId })
         return c.json({ type: "error", error: { type: "invalid_request_error", message: "messages is required and must be a non-empty array" }, request_id: reqId }, 400)
       }
 
@@ -359,9 +537,68 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       const stream = body.stream ?? false
       const hasTools = body.tools?.length > 0
       const abortController = new AbortController()
-      const timeout = setTimeout(() => abortController.abort(), finalConfig.requestTimeoutMs)
 
-      // Extended thinking: map Anthropic API thinking param to SDK ThinkingConfig
+      // Stall-based timeout: only aborts if no SDK events received for stallTimeoutMs.
+      // Resets on every SDK event, so active requests never get killed.
+      // NOTE: not started until queue is acquired — queue wait doesn't count.
+      let stallTimer: ReturnType<typeof setTimeout> | null = null
+      const resetStallTimer = () => {
+        if (stallTimer) clearTimeout(stallTimer)
+        stallTimer = setTimeout(() => {
+          abortReason = "stall"
+          logWarn("request.stall_timeout", {
+            reqId,
+            stallTimeoutMs: finalConfig.stallTimeoutMs,
+            phase: trace?.phase,
+            sdkEventCount: trace?.sdkEventCount,
+            outputLen: trace?.outputLen,
+            lastEventType: trace?.lastEventType,
+          })
+          abortController.abort()
+        }, finalConfig.stallTimeoutMs)
+      }
+      const clearStallTimer = () => {
+        if (stallTimer) { clearTimeout(stallTimer); stallTimer = null }
+      }
+
+      // Hard max duration: kills request even if actively streaming. Safety valve.
+      let hardTimer: ReturnType<typeof setTimeout> | null = null
+      const startHardTimer = () => {
+        hardTimer = setTimeout(() => {
+          abortReason = "max_duration"
+          logError("request.max_duration", {
+            reqId,
+            maxDurationMs: finalConfig.maxDurationMs,
+            phase: trace?.phase,
+            sdkEventCount: trace?.sdkEventCount,
+            outputLen: trace?.outputLen,
+            model: trace?.model,
+            lastEventType: trace?.lastEventType,
+          })
+          abortController.abort()
+        }, finalConfig.maxDurationMs)
+      }
+      const clearHardTimer = () => {
+        if (hardTimer) { clearTimeout(hardTimer); hardTimer = null }
+      }
+
+      // Output size check: kills request if output exceeds maxOutputChars.
+      const checkOutputSize = (outputLen: number) => {
+        if (outputLen > finalConfig.maxOutputChars && !abortReason) {
+          abortReason = "max_output"
+          logError("request.max_output", {
+            reqId,
+            outputLen,
+            maxOutputChars: finalConfig.maxOutputChars,
+            phase: trace?.phase,
+            sdkEventCount: trace?.sdkEventCount,
+            model: trace?.model,
+            elapsedMs: trace ? Date.now() - trace.startedAt : undefined,
+          })
+          abortController.abort()
+        }
+      }
+
       const thinking: { type: "adaptive" } | { type: "enabled"; budgetTokens?: number } | { type: "disabled" } | undefined =
         body.thinking?.type === "enabled" ? { type: "enabled", budgetTokens: body.thinking.budget_tokens }
         : body.thinking?.type === "disabled" ? { type: "disabled" }
@@ -382,10 +619,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         }
       }
 
-      // Build the prompt from messages. The SDK's query() takes a single prompt
-      // string, so multi-turn conversations are serialized with XML-delimited
-      // turns. Prior turns go into the system prompt as context, the last user
-      // message becomes the prompt.
       const messages = body.messages as Array<{ role: string; content: string | Array<any> }>
 
       let prompt: string
@@ -401,30 +634,88 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
         const contextParts = priorMsgs
           .map((m) => {
-            const tag = m.role === "assistant" ? "assistant_message" : "user_message"
-            return `<${tag}>\n${serializeContent(m.content, tempFiles)}\n</${tag}>`
+            const role = m.role === "assistant" ? "Assistant" : "User"
+            return `[${role}]\n${serializeContent(m.content, tempFiles)}`
           })
           .join("\n\n")
 
         const baseSystem = systemContext || ""
         const contextSection = contextParts
-          ? `\n\n<conversation_history>\n${contextParts}\n</conversation_history>`
+          ? `\n\nPrior conversation turns:\n\n${contextParts}\n\n---`
           : ""
         systemPrompt = (baseSystem + contextSection + toolsSection).trim() || undefined
         prompt = serializeContent(lastMsg.content, tempFiles)
       }
 
-      claudeLog("proxy.request", { reqId, model, stream, msgs: body.messages?.length, hasTools, ...(thinking ? { thinking: thinking.type } : {}), queueActive: requestQueue.activeCount, queueWaiting: requestQueue.waitingCount })
+      requestStarted = Date.now()
 
-      // Acquire a slot in the concurrency queue — all code after this MUST
-      // release via the try/finally blocks in both streaming and non-streaming paths.
+      // Capture client info
+      const clientIp = c.req.header("x-forwarded-for")
+        ?? c.req.header("x-real-ip")
+        ?? c.req.header("cf-connecting-ip")
+        ?? "unknown"
+      const userAgent = c.req.header("user-agent") ?? "unknown"
+      const bodyBytes = JSON.stringify(body).length
+
+      // ── Create trace ──────────────────────────────────────────────────────
+      trace = traceStore.create({
+        reqId,
+        model,
+        requestedModel: body.model || "sonnet",
+        stream,
+        hasTools,
+        thinking: thinking?.type,
+        promptLen: prompt.length,
+        systemLen: systemPrompt?.length ?? 0,
+        msgCount: messages.length,
+        bodyBytes,
+        clientIp,
+        userAgent,
+      })
+
+      // ── Queue ─────────────────────────────────────────────────────────────
+      const queueActive = requestQueue.activeCount
+      const queueWaiting = requestQueue.waitingCount
+      const needsQueue = queueActive >= MAX_CONCURRENT
+
+      traceStore.phase(reqId, "queued", { queueActive, queueWaiting })
+
+      if (needsQueue) {
+        logInfo("queue.waiting", {
+          reqId,
+          model,
+          queueActive,
+          queueWaiting,
+          queueTimeoutMs: QUEUE_TIMEOUT_MS,
+        })
+      }
+
       await requestQueue.acquire()
+
+      const queueWaitMs = Date.now() - requestStarted
+      traceStore.phase(reqId, "acquired", { queueWaitMs })
+
+      logInfo("queue.acquired", {
+        reqId,
+        queueWaitMs,
+        queueActive: requestQueue.activeCount,
+        queueWaiting: requestQueue.waitingCount,
+      })
+
+      // Start timers AFTER queue acquire — queue wait doesn't count
+      resetStallTimer()
+      startHardTimer()
 
       // ── Non-streaming ──────────────────────────────────────────────────────
       if (!stream) {
         let fullText = ""
         try {
+          traceStore.phase(reqId, "sdk_starting")
+          let sdkEventCount = 0
           for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: false, systemPrompt, abortController, thinking }) })) {
+            sdkEventCount++
+            resetStallTimer()
+            traceStore.sdkEvent(reqId, sdkEventCount, message.type, (message as any).event?.type ?? (message as any).message?.type)
             if (message.type === "assistant") {
               let turnText = ""
               for (const block of message.message.content) {
@@ -433,11 +724,19 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               fullText = turnText
             }
           }
+          traceStore.phase(reqId, "sdk_done")
         } finally {
-          clearTimeout(timeout)
+          clearStallTimer(); clearHardTimer()
           cleanupTempFiles(tempFiles)
           requestQueue.release()
+          logDebug("queue.released", {
+            reqId,
+            queueActive: requestQueue.activeCount,
+            queueWaiting: requestQueue.waitingCount,
+          })
         }
+
+        traceStore.phase(reqId, "responding")
 
         if (hasTools) {
           const { toolCalls, textBefore } = parseToolUse(fullText)
@@ -446,7 +745,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
           for (const tc of toolCalls) content.push({ type: "tool_use", id: tc.id, name: tc.name, input: tc.input })
           if (content.length === 0) content.push({ type: "text", text: fullText || "..." })
           const stopReason = toolCalls.length > 0 ? "tool_use" : "end_turn"
-          claudeLog("proxy.response", { reqId, len: fullText.length, toolCalls: toolCalls.length })
+
+          traceStore.complete(reqId, { outputLen: fullText.length, toolCallCount: toolCalls.length })
+
           return c.json({
             id: generateId("msg_"),
             type: "message", role: "assistant", content,
@@ -456,7 +757,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         }
 
         if (!fullText || !fullText.trim()) fullText = "..."
-        claudeLog("proxy.response", { reqId, len: fullText.length })
+        traceStore.complete(reqId, { outputLen: fullText.length })
+
         return c.json({
           id: generateId("msg_"),
           type: "message", role: "assistant",
@@ -470,23 +772,62 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       const encoder = new TextEncoder()
       const readable = new ReadableStream({
         cancel() {
-          // Client disconnected — abort the SDK query to free resources
+          clientDisconnected = true
+          logWarn("stream.client_disconnect", {
+            reqId,
+            phase: trace?.phase,
+            sdkEventCount: trace?.sdkEventCount,
+            outputLen: trace?.outputLen,
+            elapsedMs: trace ? Date.now() - trace.startedAt : undefined,
+            model: trace?.model,
+          })
           abortController.abort()
         },
         async start(controller) {
           const messageId = generateId("msg_")
           let queueReleased = false
-          const releaseQueue = () => { if (!queueReleased) { queueReleased = true; requestQueue.release() } }
+          const releaseQueue = () => {
+            if (!queueReleased) {
+              queueReleased = true
+              requestQueue.release()
+              logDebug("queue.released", {
+                reqId,
+                queueActive: requestQueue.activeCount,
+                queueWaiting: requestQueue.waitingCount,
+              })
+            }
+          }
 
+          let sseSendErrors = 0
           const sse = (event: string, data: object) => {
             try {
               controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`))
-            } catch {}
+            } catch (e) {
+              sseSendErrors++
+              if (sseSendErrors <= 3) {
+                logWarn("stream.sse_send_failed", {
+                  reqId,
+                  event,
+                  sseSendErrors,
+                  error: e instanceof Error ? e.message : String(e),
+                })
+              }
+            }
           }
 
           try {
             const heartbeat = setInterval(() => {
-              try { controller.enqueue(encoder.encode(`event: ping\ndata: {"type": "ping"}\n\n`)) } catch { clearInterval(heartbeat) }
+              try {
+                controller.enqueue(encoder.encode(`event: ping\ndata: {"type": "ping"}\n\n`))
+              } catch (e) {
+                logWarn("stream.heartbeat_failed", {
+                  reqId,
+                  error: e instanceof Error ? e.message : String(e),
+                  phase: trace?.phase,
+                  elapsedMs: trace ? Date.now() - trace.startedAt : undefined,
+                })
+                clearInterval(heartbeat)
+              }
             }, 15_000)
 
             sse("message_start", {
@@ -501,24 +842,44 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             if (hasTools) {
               // ── With tools: buffer output, parse tool_use blocks at end ──
               let fullText = ""
+              let sdkEventCount = 0
+              let lastEventAt = Date.now()
+              const stallLog = setInterval(() => {
+                const stallMs = Date.now() - lastEventAt
+                traceStore.stall(reqId, stallMs)
+              }, 15_000)
               try {
+                traceStore.phase(reqId, "sdk_starting")
                 for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking }) })) {
+                  sdkEventCount++
+                  lastEventAt = Date.now()
+                  resetStallTimer()
+                  const subtype = (message as any).event?.type ?? (message as any).message?.type
                   if (message.type === "stream_event") {
                     const ev = message.event as any
+                    // Detect first content event BEFORE sdkEvent records it
+                    if (!trace!.firstTokenAt && (ev.type === "content_block_delta" || ev.type === "content_block_start")) {
+                      traceStore.phase(reqId, "sdk_streaming")
+                    }
                     if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
                       fullText += ev.delta.text ?? ""
+                      traceStore.updateOutput(reqId, fullText.length)
+                      checkOutputSize(fullText.length)
                     }
                   }
+                  traceStore.sdkEvent(reqId, sdkEventCount, message.type, subtype)
                 }
+                traceStore.phase(reqId, "sdk_done")
               } finally {
+                clearInterval(stallLog)
                 clearInterval(heartbeat)
-                clearTimeout(timeout)
+                clearStallTimer(); clearHardTimer()
                 cleanupTempFiles(tempFiles)
                 releaseQueue()
               }
 
+              traceStore.phase(reqId, "responding")
               const { toolCalls, textBefore } = parseToolUse(fullText)
-              claudeLog("proxy.stream.done", { reqId, len: fullText.length, toolCalls: toolCalls.length })
 
               let blockIdx = 0
               const textContent = toolCalls.length === 0 ? (fullText || "...") : textBefore
@@ -544,6 +905,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               sse("message_delta", { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: roughTokens(fullText) } })
               sse("message_stop", { type: "message_stop" })
               controller.close()
+
+              traceStore.complete(reqId, { outputLen: fullText.length, toolCallCount: toolCalls.length })
               return
             }
 
@@ -552,28 +915,46 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
             let fullText = ""
             let hasStreamed = false
+            let sdkEventCount = 0
+            let lastEventAt = Date.now()
+            const stallLog = setInterval(() => {
+              const stallMs = Date.now() - lastEventAt
+              traceStore.stall(reqId, stallMs)
+            }, 15_000)
             try {
+              traceStore.phase(reqId, "sdk_starting")
               for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking }) })) {
+                sdkEventCount++
+                lastEventAt = Date.now()
+                resetStallTimer()
+                const subtype = (message as any).event?.type ?? (message as any).message?.type
                 if (message.type === "stream_event") {
                   const ev = message.event as any
+                  // Detect first content event BEFORE sdkEvent records it
+                  if (!trace!.firstTokenAt && (ev.type === "content_block_delta" || ev.type === "content_block_start")) {
+                    traceStore.phase(reqId, "sdk_streaming")
+                  }
                   if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
                     const text = ev.delta.text ?? ""
                     if (text) {
                       fullText += text
                       hasStreamed = true
+                      traceStore.updateOutput(reqId, fullText.length)
+                      checkOutputSize(fullText.length)
                       sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })
                     }
                   }
                 }
+                traceStore.sdkEvent(reqId, sdkEventCount, message.type, subtype)
               }
+              traceStore.phase(reqId, "sdk_done")
             } finally {
+              clearInterval(stallLog)
               clearInterval(heartbeat)
-              clearTimeout(timeout)
+              clearStallTimer(); clearHardTimer()
               cleanupTempFiles(tempFiles)
               releaseQueue()
             }
-
-            claudeLog("proxy.stream.done", { reqId, len: fullText.length })
 
             if (!hasStreamed) {
               sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "..." } })
@@ -584,18 +965,58 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             sse("message_stop", { type: "message_stop" })
             controller.close()
 
+            traceStore.complete(reqId, { outputLen: fullText.length })
+
           } catch (error) {
-            clearTimeout(timeout)
+            clearStallTimer(); clearHardTimer()
             releaseQueue()
-            const isAbort = error instanceof Error && error.name === "AbortError"
-            const errMsg = isAbort ? "Request timeout" : (error instanceof Error ? error.message : "Unknown error")
-            const errType = isAbort ? "overloaded_error" : "api_error"
-            claudeLog("proxy.stream.error", { reqId, error: errMsg })
+            const err = error instanceof Error ? error : new Error(String(error))
+            const isAbort = err.name === "AbortError" || err.message?.includes("abort")
+            const isQueueTimeout = err.message.includes("Queue timeout")
+
+            let errMsg: string
+            let errType: string
+            if (clientDisconnected) {
+              errMsg = "Client disconnected during streaming."
+              errType = "api_error"
+            } else if (abortReason === "max_duration") {
+              errMsg = `Request exceeded max duration of ${finalConfig.maxDurationMs / 1000}s. Output: ${trace?.outputLen ?? 0} chars.`
+              errType = "api_error"
+            } else if (abortReason === "max_output") {
+              errMsg = `Request exceeded max output size of ${finalConfig.maxOutputChars} chars.`
+              errType = "api_error"
+            } else if (isAbort) {
+              errMsg = `Request stalled — no SDK activity for ${finalConfig.stallTimeoutMs / 1000}s. Please retry.`
+              errType = "api_error"
+            } else if (isQueueTimeout) {
+              errMsg = "Server busy — all request slots are occupied. Please retry shortly."
+              errType = "overloaded_error"
+            } else {
+              errMsg = err.message
+              errType = "api_error"
+            }
+
+            // Trace the failure with full context
+            traceStore.fail(reqId, err, "error", {
+              clientDisconnect: clientDisconnected,
+              abortReason,
+              aborted: isAbort,
+              queueTimeout: isQueueTimeout,
+              stallTimeoutMs: finalConfig.stallTimeoutMs,
+              maxDurationMs: finalConfig.maxDurationMs,
+              maxOutputChars: finalConfig.maxOutputChars,
+              sseSendErrors,
+            })
+
             cleanupTempFiles(tempFiles)
-            try {
-              sse("error", { type: "error", error: { type: errType, message: errMsg }, request_id: reqId })
-              controller.close()
-            } catch {}
+            if (!clientDisconnected) {
+              try {
+                sse("error", { type: "error", error: { type: errType, message: errMsg }, request_id: reqId })
+                controller.close()
+              } catch {}
+            } else {
+              try { controller.close() } catch {}
+            }
           }
         }
       })
@@ -609,13 +1030,51 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       })
 
     } catch (error) {
-      const isAbort = error instanceof Error && error.name === "AbortError"
-      const errMsg = isAbort ? "Request timeout" : (error instanceof Error ? error.message : "Unknown error")
-      const errType = isAbort ? "overloaded_error" : "api_error"
-      claudeLog("proxy.error", { reqId, error: errMsg })
-      if (isAbort) {
+      const err = error instanceof Error ? error : new Error(String(error))
+      const isAbort = err.name === "AbortError" || err.message?.includes("abort")
+      const isQueueTimeout = err.message.includes("Queue timeout")
+
+      let errMsg: string
+      let errType: string
+      if (clientDisconnected) {
+        errMsg = "Client disconnected."
+        errType = "api_error"
+      } else if (abortReason === "max_duration") {
+        errMsg = `Request exceeded max duration of ${finalConfig.maxDurationMs / 1000}s.`
+        errType = "api_error"
+      } else if (abortReason === "max_output") {
+        errMsg = `Request exceeded max output size of ${finalConfig.maxOutputChars} chars.`
+        errType = "api_error"
+      } else if (isAbort) {
+        errMsg = `Request stalled — no SDK activity for ${finalConfig.stallTimeoutMs / 1000}s. Please retry.`
+        errType = "api_error"
+      } else if (isQueueTimeout) {
+        errMsg = "Server busy — all request slots are occupied. Please retry shortly."
+        errType = "overloaded_error"
+      } else {
+        errMsg = err.message
+        errType = "api_error"
+      }
+
+      // Trace the failure
+      if (trace) {
+        traceStore.fail(reqId, err, "error", {
+          clientDisconnect: clientDisconnected,
+          aborted: isAbort,
+          queueTimeout: isQueueTimeout,
+        })
+      } else {
+        logError("request.error.no_trace", { reqId, error: errMsg, stack: err.stack })
+      }
+
+      if (isQueueTimeout) {
         return new Response(JSON.stringify({ type: "error", error: { type: errType, message: errMsg }, request_id: reqId }), {
           status: 529, headers: { "Content-Type": "application/json" }
+        })
+      }
+      if (isAbort) {
+        return new Response(JSON.stringify({ type: "error", error: { type: errType, message: errMsg }, request_id: reqId }), {
+          status: 504, headers: { "Content-Type": "application/json" }
         })
       }
       return c.json({ type: "error", error: { type: errType, message: errMsg }, request_id: reqId }, 500)
@@ -635,20 +1094,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
   app.get("/v1/messages/batches/:id", handleBatches)
 
   // ── OpenAI-compatible /v1/chat/completions ─────────────────────────────
-  // Translates OpenAI ChatCompletion format to/from Anthropic Messages API
-  // so tools expecting OpenAI endpoints (LangChain, LiteLLM, etc.) just work.
 
   function convertOpenaiContent(content: any): any {
-    // String content → pass through
     if (typeof content === "string") return content
     if (!Array.isArray(content)) return String(content ?? "")
 
-    // Array content → convert image_url parts to Anthropic image blocks
     return content.map((part: any) => {
       if (part.type === "text") return { type: "text", text: part.text ?? "" }
       if (part.type === "image_url" && part.image_url?.url) {
         const url = part.image_url.url as string
-        // Data URL: data:image/jpeg;base64,...
         const dataMatch = url.match(/^data:(image\/\w+);base64,(.+)$/)
         if (dataMatch) {
           return {
@@ -660,7 +1114,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             }
           }
         }
-        // HTTP URL — pass as URL source
         return {
           type: "image",
           source: { type: "url", url }
@@ -683,7 +1136,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       } else if (msg.role === "user") {
         converted.push({ role: "user", content: convertOpenaiContent(msg.content) })
       } else if (msg.role === "assistant") {
-        // Handle assistant messages with tool_calls (OpenAI format)
         if (msg.tool_calls?.length) {
           const content: any[] = []
           if (msg.content) content.push({ type: "text", text: msg.content })
@@ -700,7 +1152,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
           converted.push({ role: "assistant", content: msg.content ?? "" })
         }
       } else if (msg.role === "tool") {
-        // OpenAI tool result → Anthropic tool_result
         converted.push({
           role: "user",
           content: [{
@@ -782,7 +1233,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       const stream = body.stream ?? false
       const requestedModel = body.model ?? "claude-sonnet-4-6"
 
-      // Build Anthropic-format request body
       const anthropicBody: any = {
         model: requestedModel,
         messages,
@@ -795,12 +1245,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       if (body.temperature !== undefined) anthropicBody.temperature = body.temperature
       if (body.top_p !== undefined) anthropicBody.top_p = body.top_p
       if (body.stop) anthropicBody.stop_sequences = Array.isArray(body.stop) ? body.stop : [body.stop]
-      // Convert OpenAI tools format to Anthropic tools format
       if (body.tools?.length) {
         anthropicBody.tools = openaiToAnthropicTools(body.tools)
       }
 
-      // Forward to our own /v1/messages handler by making an internal request
       const internalHeaders: Record<string, string> = { "Content-Type": "application/json" }
       const authHeader = c.req.header("authorization") ?? c.req.header("x-api-key")
       if (authHeader) {
@@ -821,7 +1269,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         return c.json(anthropicToOpenaiResponse(anthropicJson, requestedModel))
       }
 
-      // Streaming: translate SSE events from Anthropic format to OpenAI format
       const includeUsage = body.stream_options?.include_usage === true
       const encoder = new TextEncoder()
       const readable = new ReadableStream({
@@ -836,7 +1283,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             const created = Math.floor(Date.now() / 1000)
             let sentRole = false
             let finishReason: string | null = null
-            // Track active tool calls for streaming
             const activeToolCalls: Map<number, { id: string; name: string }> = new Map()
             let toolCallIndex = 0
             let usageInfo: { input_tokens: number; output_tokens: number } | null = null
@@ -854,7 +1300,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 try {
                   const event = JSON.parse(line.slice(6))
 
-                  // Emit role delta on first event
                   if (!sentRole && (event.type === "content_block_start" || event.type === "content_block_delta")) {
                     sentRole = true
                     controller.enqueue(encoder.encode(`data: ${JSON.stringify({
@@ -864,7 +1309,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   }
 
                   if (event.type === "content_block_start" && event.content_block?.type === "tool_use") {
-                    // Start of a tool_use block → emit tool_call function header
                     const idx = toolCallIndex++
                     activeToolCalls.set(event.index, { id: event.content_block.id, name: event.content_block.name })
                     controller.enqueue(encoder.encode(`data: ${JSON.stringify({
@@ -874,7 +1318,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                       }, finish_reason: null }]
                     })}\n\n`))
                   } else if (event.type === "content_block_delta" && event.delta?.type === "input_json_delta") {
-                    // Tool call argument streaming
                     const tc = activeToolCalls.get(event.index)
                     if (tc) {
                       const idx = Array.from(activeToolCalls.keys()).indexOf(event.index)
@@ -891,7 +1334,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                       choices: [{ index: 0, delta: { content: event.delta.text }, finish_reason: null }]
                     })}\n\n`))
                   } else if (event.type === "message_delta") {
-                    // Capture finish reason and usage for final chunk
                     const sr = event.delta?.stop_reason
                     finishReason = sr === "tool_use" ? "tool_calls" : sr === "max_tokens" ? "length" : "stop"
                     if (event.usage) {
@@ -903,7 +1345,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                       }
                     }
                   } else if (event.type === "message_start" && event.message?.usage) {
-                    // Capture input token count from message_start
                     usageInfo = { input_tokens: event.message.usage.input_tokens ?? 0, output_tokens: 0 }
                   } else if (event.type === "message_stop") {
                     const finalChunk: any = {
@@ -959,7 +1400,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
   })
   app.get("/v1/chat/models", handleOpenaiModels)
 
-  // 404 catch-all — return Anthropic-format error for unknown routes
+  // 404 catch-all
   app.all("*", (c) => c.json({
     type: "error",
     error: { type: "not_found_error", message: `${c.req.method} ${c.req.path} not found` }
@@ -978,12 +1419,60 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}) {
     idleTimeout: 0
   })
 
+  // Startup log with full configuration
+  logInfo("proxy.started", {
+    version: PROXY_VERSION,
+    host: finalConfig.host,
+    port: finalConfig.port,
+    stallTimeoutMs: finalConfig.stallTimeoutMs,
+    maxDurationMs: finalConfig.maxDurationMs,
+    maxOutputChars: finalConfig.maxOutputChars,
+    maxConcurrent: MAX_CONCURRENT,
+    queueTimeoutMs: QUEUE_TIMEOUT_MS,
+    claudeExecutable,
+    logDir: LOG_DIR,
+    debug: finalConfig.debug,
+    pid: process.pid,
+  })
+
   console.log(`Claude SDK Proxy v${PROXY_VERSION} running at http://${finalConfig.host}:${finalConfig.port}`)
+  console.log(`  Logs: ${LOG_DIR}`)
+  console.log(`  Debug: http://${finalConfig.host}:${finalConfig.port}/debug/stats`)
+
+  // Periodic health logging (every 5 minutes)
+  const healthInterval = setInterval(() => {
+    const mem = process.memoryUsage()
+    const stats = traceStore.getStats()
+    logInfo("proxy.health", {
+      pid: process.pid,
+      rssBytes: mem.rss,
+      rssMB: +(mem.rss / 1024 / 1024).toFixed(1),
+      heapUsedMB: +(mem.heapUsed / 1024 / 1024).toFixed(1),
+      heapTotalMB: +(mem.heapTotal / 1024 / 1024).toFixed(1),
+      externalMB: +(mem.external / 1024 / 1024).toFixed(1),
+      uptimeMs: stats.uptimeMs,
+      totalRequests: stats.requests.total,
+      totalErrors: stats.requests.errors,
+      activeRequests: stats.requests.active,
+      queueActive: requestQueue.activeCount,
+      queueWaiting: requestQueue.waitingCount,
+    })
+  }, 300_000) // 5 minutes
 
   // Graceful shutdown
   const shutdown = (signal: string) => {
+    const stats = traceStore.getStats()
+    logInfo("proxy.shutdown", {
+      signal,
+      pid: process.pid,
+      totalRequests: stats.requests.total,
+      totalErrors: stats.requests.errors,
+      activeRequests: stats.requests.active,
+      uptimeMs: stats.uptimeMs,
+    })
+    clearInterval(healthInterval)
     console.log(`\nReceived ${signal}, shutting down...`)
-    server.stop(true) // true = wait for in-flight requests
+    server.stop(true)
     process.exit(0)
   }
   process.on("SIGINT", () => shutdown("SIGINT"))
