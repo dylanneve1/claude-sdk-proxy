@@ -6,6 +6,7 @@ import type { ProxyConfig } from "./types"
 import { DEFAULT_PROXY_CONFIG } from "./types"
 import { logInfo, logWarn, logError, logDebug, LOG_DIR } from "../logger"
 import { traceStore } from "../trace"
+import { sessionStore } from "../session-store"
 import { execSync } from "child_process"
 import { existsSync, writeFileSync, unlinkSync, readFileSync, readdirSync } from "fs"
 import { tmpdir } from "os"
@@ -265,6 +266,7 @@ function buildQueryOptions(
     systemPrompt?: string
     abortController?: AbortController
     thinking?: { type: "adaptive" } | { type: "enabled"; budgetTokens?: number } | { type: "disabled" }
+    resume?: string
   } = {}
 ) {
   return {
@@ -272,7 +274,7 @@ function buildQueryOptions(
     pathToClaudeCodeExecutable: claudeExecutable,
     permissionMode: "bypassPermissions" as const,
     allowDangerouslySkipPermissions: true,
-    persistSession: false,
+    persistSession: true,
     settingSources: [],
     tools: ["_proxy_noop_"] as string[],
     maxTurns: 1,
@@ -280,6 +282,7 @@ function buildQueryOptions(
     ...(opts.abortController ? { abortController: opts.abortController } : {}),
     ...(opts.thinking ? { thinking: opts.thinking } : {}),
     ...(opts.systemPrompt ? { systemPrompt: opts.systemPrompt } : {}),
+    ...(opts.resume ? { resume: opts.resume } : {}),
   }
 }
 
@@ -335,7 +338,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
     service: "claude-sdk-proxy",
     version: PROXY_VERSION,
     format: "anthropic",
-    endpoints: ["/v1/messages", "/v1/models", "/v1/chat/completions", "/debug/stats", "/debug/traces", "/debug/errors", "/debug/active", "/debug/health"],
+    endpoints: ["/v1/messages", "/v1/models", "/v1/chat/completions", "/debug/stats", "/debug/traces", "/debug/errors", "/debug/active", "/debug/health", "/sessions", "/sessions/cleanup"],
     queue: { active: requestQueue.activeCount, waiting: requestQueue.waitingCount, max: MAX_CONCURRENT },
     logDir: LOG_DIR,
   }))
@@ -344,6 +347,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
   app.get("/debug/stats", (c) => {
     const stats = traceStore.getStats()
+    const sessionStats = sessionStore.getStats()
     return c.json({
       version: PROXY_VERSION,
       config: {
@@ -357,8 +361,23 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         debug: finalConfig.debug,
       },
       queue: { active: requestQueue.activeCount, waiting: requestQueue.waitingCount, max: MAX_CONCURRENT },
+      sessions: sessionStats,
       ...stats,
     })
+  })
+
+  // ── Session management endpoints ──────────────────────────────────────
+
+  app.get("/sessions", (c) => {
+    return c.json({
+      sessions: sessionStore.list(),
+      stats: sessionStore.getStats(),
+    })
+  })
+
+  app.get("/sessions/cleanup", (c) => {
+    const result = sessionStore.cleanup()
+    return c.json(result)
   })
 
   app.get("/debug/traces", (c) => {
@@ -625,7 +644,37 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       let systemPrompt: string | undefined
       const toolsSection = hasTools ? buildClientToolsPrompt(body.tools) : ""
 
-      if (messages.length === 1) {
+      // ── Session resumption ─────────────────────────────────────────────
+      // If a conversation ID is provided and we have a stored SDK session,
+      // we can resume it instead of resending the full conversation history.
+      const conversationId = c.req.header("x-conversation-id")
+        ?? c.req.header("x-session-id")
+        ?? null
+      let resumeSessionId: string | undefined
+      let isResuming = false
+
+      if (conversationId && messages.length > 1) {
+        const stored = sessionStore.get(conversationId)
+        if (stored && stored.model === model) {
+          resumeSessionId = stored.sdkSessionId
+          isResuming = true
+          logInfo("session.resuming", {
+            reqId,
+            conversationId,
+            sdkSessionId: resumeSessionId,
+            storedMsgCount: stored.messageCount,
+            currentMsgCount: messages.length,
+            resumeCount: stored.resumeCount,
+          })
+        }
+      }
+
+      if (isResuming && resumeSessionId) {
+        // Resume mode: only send the latest user message, SDK loads history from disk
+        const lastMsg = messages[messages.length - 1]!
+        systemPrompt = ((systemContext || "") + toolsSection).trim() || undefined
+        prompt = serializeContent(lastMsg.content, tempFiles)
+      } else if (messages.length === 1) {
         systemPrompt = ((systemContext || "") + toolsSection).trim() || undefined
         prompt = serializeContent(messages[0]!.content, tempFiles)
       } else {
@@ -709,13 +758,19 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       // ── Non-streaming ──────────────────────────────────────────────────────
       if (!stream) {
         let fullText = ""
+        let capturedSessionId: string | undefined
+        const queryOpts = buildQueryOptions(model, { partial: false, systemPrompt, abortController, thinking, resume: resumeSessionId })
         try {
           traceStore.phase(reqId, "sdk_starting")
           let sdkEventCount = 0
-          for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: false, systemPrompt, abortController, thinking }) })) {
+          for await (const message of query({ prompt, options: queryOpts })) {
             sdkEventCount++
             resetStallTimer()
             traceStore.sdkEvent(reqId, sdkEventCount, message.type, (message as any).event?.type ?? (message as any).message?.type)
+            // Capture session_id from init message
+            if (message.type === "system" && (message as any).subtype === "init" && (message as any).session_id) {
+              capturedSessionId = (message as any).session_id
+            }
             if (message.type === "assistant") {
               let turnText = ""
               for (const block of message.message.content) {
@@ -725,6 +780,71 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             }
           }
           traceStore.phase(reqId, "sdk_done")
+
+          // Store session mapping for future resumption
+          if (conversationId && capturedSessionId) {
+            if (isResuming) {
+              sessionStore.recordResume(conversationId)
+              logInfo("session.resumed_ok", { reqId, conversationId, sdkSessionId: capturedSessionId })
+            } else {
+              sessionStore.set(conversationId, capturedSessionId, model, messages.length)
+              logInfo("session.created", { reqId, conversationId, sdkSessionId: capturedSessionId })
+            }
+          }
+        } catch (resumeErr) {
+          // If resume failed, retry with full context
+          if (isResuming && resumeSessionId) {
+            logWarn("session.resume_failed", {
+              reqId,
+              conversationId,
+              sdkSessionId: resumeSessionId,
+              error: resumeErr instanceof Error ? resumeErr.message : String(resumeErr),
+            })
+            if (conversationId) {
+              sessionStore.recordFailure(conversationId)
+              sessionStore.invalidate(conversationId)
+            }
+            // Rebuild with full context (non-resume path)
+            const lastMsg = messages[messages.length - 1]!
+            const priorMsgs = messages.slice(0, -1)
+            const contextParts = priorMsgs
+              .map((m) => {
+                const role = m.role === "assistant" ? "Assistant" : "User"
+                return `[${role}]\n${serializeContent(m.content, tempFiles)}`
+              })
+              .join("\n\n")
+            const baseSystem = systemContext || ""
+            const contextSection = contextParts ? `\n\nPrior conversation turns:\n\n${contextParts}\n\n---` : ""
+            const fallbackSystem = (baseSystem + contextSection + toolsSection).trim() || undefined
+            const fallbackPrompt = serializeContent(lastMsg.content, tempFiles)
+            const fallbackOpts = buildQueryOptions(model, { partial: false, systemPrompt: fallbackSystem, abortController, thinking })
+
+            logInfo("session.fallback_full_context", { reqId, conversationId })
+            let sdkEventCount = 0
+            for await (const message of query({ prompt: fallbackPrompt, options: fallbackOpts })) {
+              sdkEventCount++
+              resetStallTimer()
+              traceStore.sdkEvent(reqId, sdkEventCount, message.type, (message as any).event?.type ?? (message as any).message?.type)
+              if (message.type === "system" && (message as any).subtype === "init" && (message as any).session_id) {
+                capturedSessionId = (message as any).session_id
+              }
+              if (message.type === "assistant") {
+                let turnText = ""
+                for (const block of message.message.content) {
+                  if (block.type === "text") turnText += block.text
+                }
+                fullText = turnText
+              }
+            }
+            traceStore.phase(reqId, "sdk_done")
+            // Store the new session
+            if (conversationId && capturedSessionId) {
+              sessionStore.set(conversationId, capturedSessionId, model, messages.length)
+              logInfo("session.recreated_after_fallback", { reqId, conversationId, sdkSessionId: capturedSessionId })
+            }
+          } else {
+            throw resumeErr
+          }
         } finally {
           clearStallTimer(); clearHardTimer()
           cleanupTempFiles(tempFiles)
@@ -848,13 +968,18 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 const stallMs = Date.now() - lastEventAt
                 traceStore.stall(reqId, stallMs)
               }, 15_000)
+              let capturedSessionId: string | undefined
               try {
                 traceStore.phase(reqId, "sdk_starting")
-                for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking }) })) {
+                for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking, resume: resumeSessionId }) })) {
                   sdkEventCount++
                   lastEventAt = Date.now()
                   resetStallTimer()
                   const subtype = (message as any).event?.type ?? (message as any).message?.type
+                  // Capture session_id from init message
+                  if (message.type === "system" && (message as any).subtype === "init" && (message as any).session_id) {
+                    capturedSessionId = (message as any).session_id
+                  }
                   if (message.type === "stream_event") {
                     const ev = message.event as any
                     // Detect first content event BEFORE sdkEvent records it
@@ -870,6 +995,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   traceStore.sdkEvent(reqId, sdkEventCount, message.type, subtype)
                 }
                 traceStore.phase(reqId, "sdk_done")
+
+                // Store session mapping
+                if (conversationId && capturedSessionId) {
+                  if (isResuming) {
+                    sessionStore.recordResume(conversationId)
+                  } else {
+                    sessionStore.set(conversationId, capturedSessionId, model, messages.length)
+                  }
+                }
               } finally {
                 clearInterval(stallLog)
                 clearInterval(heartbeat)
@@ -917,17 +1051,22 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             let hasStreamed = false
             let sdkEventCount = 0
             let lastEventAt = Date.now()
+            let capturedSessionId2: string | undefined
             const stallLog = setInterval(() => {
               const stallMs = Date.now() - lastEventAt
               traceStore.stall(reqId, stallMs)
             }, 15_000)
             try {
               traceStore.phase(reqId, "sdk_starting")
-              for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking }) })) {
+              for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking, resume: resumeSessionId }) })) {
                 sdkEventCount++
                 lastEventAt = Date.now()
                 resetStallTimer()
                 const subtype = (message as any).event?.type ?? (message as any).message?.type
+                // Capture session_id from init message
+                if (message.type === "system" && (message as any).subtype === "init" && (message as any).session_id) {
+                  capturedSessionId2 = (message as any).session_id
+                }
                 if (message.type === "stream_event") {
                   const ev = message.event as any
                   // Detect first content event BEFORE sdkEvent records it
@@ -948,6 +1087,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 traceStore.sdkEvent(reqId, sdkEventCount, message.type, subtype)
               }
               traceStore.phase(reqId, "sdk_done")
+
+              // Store session mapping
+              if (conversationId && capturedSessionId2) {
+                if (isResuming) {
+                  sessionStore.recordResume(conversationId)
+                } else {
+                  sessionStore.set(conversationId, capturedSessionId2, model, messages.length)
+                }
+              }
             } finally {
               clearInterval(stallLog)
               clearInterval(heartbeat)
