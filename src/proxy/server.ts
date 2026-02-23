@@ -768,7 +768,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             resetStallTimer()
             traceStore.sdkEvent(reqId, sdkEventCount, message.type, (message as any).event?.type ?? (message as any).message?.type)
             // Capture session_id from init message
-            if (message.type === "system" && (message as any).subtype === "init" && (message as any).session_id) {
+            if (message.type === "system" && (message as any).subtype === "init") {
               capturedSessionId = (message as any).session_id
             }
             if (message.type === "assistant") {
@@ -825,7 +825,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               sdkEventCount++
               resetStallTimer()
               traceStore.sdkEvent(reqId, sdkEventCount, message.type, (message as any).event?.type ?? (message as any).message?.type)
-              if (message.type === "system" && (message as any).subtype === "init" && (message as any).session_id) {
+              if (message.type === "system" && (message as any).subtype === "init") {
                 capturedSessionId = (message as any).session_id
               }
               if (message.type === "assistant") {
@@ -977,7 +977,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   resetStallTimer()
                   const subtype = (message as any).event?.type ?? (message as any).message?.type
                   // Capture session_id from init message
-                  if (message.type === "system" && (message as any).subtype === "init" && (message as any).session_id) {
+                  if (message.type === "system" && (message as any).subtype === "init") {
                     capturedSessionId = (message as any).session_id
                   }
                   if (message.type === "stream_event") {
@@ -1064,7 +1064,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 resetStallTimer()
                 const subtype = (message as any).event?.type ?? (message as any).message?.type
                 // Capture session_id from init message
-                if (message.type === "system" && (message as any).subtype === "init" && (message as any).session_id) {
+                if (message.type === "system" && (message as any).subtype === "init") {
                   capturedSessionId2 = (message as any).session_id
                 }
                 if (message.type === "stream_event") {
