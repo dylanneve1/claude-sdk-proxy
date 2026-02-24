@@ -3,7 +3,7 @@ import { describe, it, expect } from "bun:test";
 describe("Error Handling", () => {
   describe("Invalid Requests", () => {
     it("should handle missing model parameter", () => {
-      const request = {
+      const request: any = {
         messages: [{ role: "user", content: "test" }],
         // model is missing
       };
@@ -13,7 +13,7 @@ describe("Error Handling", () => {
     });
 
     it("should handle invalid message format", () => {
-      const request = {
+      const request: any = {
         model: "claude-sonnet-4-6",
         messages: [
           {
@@ -23,7 +23,8 @@ describe("Error Handling", () => {
         ],
       };
       const validRoles = ["user", "assistant"];
-      expect(validRoles).not.toContain(request.messages[0].role);
+      const msgRole = request.messages?.[0]?.role;
+      expect(validRoles).not.toContain(msgRole);
     });
 
     it("should reject empty messages array", () => {
