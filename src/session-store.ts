@@ -43,6 +43,12 @@ class SessionStore {
   constructor(ttlMs = DEFAULT_TTL_MS) {
     this.ttlMs = ttlMs
     this.load()
+    // Clear all sessions on startup — SDK sessions don't survive proxy restarts
+    if (this.sessions.size > 0) {
+      logInfo("session-store.startup_clear", { cleared: this.sessions.size })
+      this.sessions.clear()
+      this.save()
+    }
   }
 
   /** Get a session by conversation ID */
