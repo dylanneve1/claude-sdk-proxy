@@ -8,8 +8,7 @@ import { logInfo, logWarn, logError, logDebug, LOG_DIR } from "../logger"
 import { traceStore } from "../trace"
 import { sessionStore } from "../session-store"
 import { execSync } from "child_process"
-import { existsSync, writeFileSync, unlinkSync, readFileSync, readdirSync } from "fs"
-import { tmpdir } from "os"
+import { existsSync, writeFileSync, readFileSync, readdirSync } from "fs"
 import { randomBytes } from "crypto"
 import { fileURLToPath } from "url"
 import { join, dirname } from "path"
@@ -96,43 +95,12 @@ function mapModelToClaudeModel(model: string): "sonnet" | "opus" | "haiku" {
 
 // ── Content-block serialization ──────────────────────────────────────────────
 
-function saveImageToTemp(block: any, tempFiles: string[]): string | null {
-  try {
-    let data: string | undefined
-    let mediaType = "image/jpeg"
-
-    if (typeof block.data === "string") {
-      data = block.data
-      mediaType = block.media_type || mediaType
-    } else if (block.source) {
-      if (block.source.type === "base64" && block.source.data) {
-        data = block.source.data
-        mediaType = block.source.media_type || mediaType
-      } else if (block.source.url) {
-        return block.source.url
-      }
-    }
-
-    if (!data) return null
-
-    const ext = mediaType.split("/")[1]?.replace("jpeg", "jpg") || "jpg"
-    const tmpPath = join(tmpdir(), `proxy-img-${randomBytes(8).toString("hex")}.${ext}`)
-    writeFileSync(tmpPath, Buffer.from(data, "base64"))
-    tempFiles.push(tmpPath)
-    return tmpPath
-  } catch {
-    return null
-  }
-}
-
-function serializeBlock(block: any, tempFiles: string[]): string {
+function serializeBlock(block: any): string {
   switch (block.type) {
     case "text":
       return block.text || ""
-    case "image": {
-      const imgPath = saveImageToTemp(block, tempFiles)
-      return imgPath ? `[Image: ${imgPath}]` : "[Image: (unable to save)]"
-    }
+    case "image":
+      return "[Image attached]"
     case "tool_use":
       return `<tool_use>\n{"name": "${block.name}", "input": ${JSON.stringify(block.input ?? {})}}\n</tool_use>`
     case "tool_result": {
@@ -151,17 +119,81 @@ function serializeBlock(block: any, tempFiles: string[]): string {
   }
 }
 
-function serializeContent(content: string | Array<any>, tempFiles: string[]): string {
+function serializeContent(content: string | Array<any>): string {
   if (typeof content === "string") return content
   if (!Array.isArray(content)) return String(content)
-  return content.map(b => serializeBlock(b, tempFiles)).filter(Boolean).join("\n")
+  return content.map(b => serializeBlock(b)).filter(Boolean).join("\n")
 }
 
-function cleanupTempFiles(tempFiles: string[]) {
-  for (const f of tempFiles) {
-    try { unlinkSync(f) } catch {}
+// ── Image handling via SDKUserMessage ────────────────────────────────────────
+// The SDK query() accepts AsyncIterable<SDKUserMessage> which supports native
+// Anthropic MessageParam content blocks including images. When images are
+// detected, we pass them through natively instead of serializing to text.
+
+function contentHasImages(content: string | Array<any>): boolean {
+  if (typeof content === "string") return false
+  if (!Array.isArray(content)) return false
+  return content.some((b: any) => b.type === "image")
+}
+
+/** Convert an Anthropic image content block to SDK-compatible format */
+function toAnthropicImageBlock(block: any): any {
+  if (block.source) return block // already in Anthropic format
+  // openclaw may use { type: "image", data: "...", mimeType: "..." }
+  if (block.data && block.mimeType) {
+    return {
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: block.mimeType,
+        data: block.data,
+      }
+    }
+  }
+  if (block.data && block.media_type) {
+    return {
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: block.media_type,
+        data: block.data,
+      }
+    }
+  }
+  return block
+}
+
+/** Build Anthropic MessageParam content array, preserving images natively */
+function buildNativeContent(content: string | Array<any>): Array<any> {
+  if (typeof content === "string") return [{ type: "text", text: content }]
+  if (!Array.isArray(content)) return [{ type: "text", text: String(content) }]
+  return content.map((block: any) => {
+    if (block.type === "image") return toAnthropicImageBlock(block)
+    if (block.type === "text") return { type: "text", text: block.text ?? "" }
+    // For other types, serialize to text
+    const serialized = serializeBlock(block)
+    return serialized ? { type: "text", text: serialized } : null
+  }).filter(Boolean)
+}
+
+/** Create an async iterable yielding a single SDKUserMessage with native content */
+function createSDKUserMessage(content: Array<any>, sessionId?: string): AsyncIterable<any> {
+  const msg = {
+    type: "user" as const,
+    message: {
+      role: "user" as const,
+      content,
+    },
+    parent_tool_use_id: null,
+    session_id: sessionId ?? "",
+  }
+  return {
+    async *[Symbol.asyncIterator]() {
+      yield msg
+    }
   }
 }
+
 
 // ── Client tool-use support ──────────────────────────────────────────────────
 
@@ -255,6 +287,42 @@ function parseToolUse(text: string): { toolCalls: ToolCall[]; textBefore: string
 
 function roughTokens(text: string): number {
   return Math.ceil((text ?? "").length / 4)
+}
+
+// ── Conversation label extraction ────────────────────────────────────────────
+// Openclaw embeds "Conversation info (untrusted metadata)" in the last user
+// message containing a JSON block with conversation_label. Extract it to use
+// as a stable conversation ID for session persistence.
+
+function extractConversationLabel(messages: Array<{ role: string; content: string | Array<any> }>): string | null {
+  // Search from the last message backwards for a user message with metadata
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]!
+    if (msg.role !== "user") continue
+
+    const text = typeof msg.content === "string"
+      ? msg.content
+      : Array.isArray(msg.content)
+        ? msg.content.filter((b: any) => b.type === "text").map((b: any) => b.text ?? "").join("\n")
+        : ""
+
+    // Look for the JSON block after "Conversation info"
+    const jsonMatch = text.match(/Conversation info[^`]*```json\s*(\{[\s\S]*?\})\s*```/)
+    if (!jsonMatch?.[1]) continue
+
+    try {
+      const meta = JSON.parse(jsonMatch[1])
+      // conversation_label is present for both PMs and groups
+      if (meta.conversation_label) return meta.conversation_label
+      // Fallback: use sender_id if no label (shouldn't happen but just in case)
+      if (meta.sender_id) return `dm:${meta.sender_id}`
+    } catch {
+      // Regex fallback if JSON parse fails
+      const labelMatch = text.match(/"conversation_label"\s*:\s*"([^"]*)"/)
+      if (labelMatch?.[1]) return labelMatch[1]
+    }
+  }
+  return null
 }
 
 // ── Query options builder ────────────────────────────────────────────────────
@@ -624,8 +692,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         : body.thinking?.type === "adaptive" ? { type: "adaptive" }
         : undefined
 
-      const tempFiles: string[] = []
-
       let systemContext = ""
       if (body.system) {
         if (typeof body.system === "string") {
@@ -640,16 +706,18 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
       const messages = body.messages as Array<{ role: string; content: string | Array<any> }>
 
-      let prompt: string
+      let promptText: string  // text version for token counting / logging
       let systemPrompt: string | undefined
       const toolsSection = hasTools ? buildClientToolsPrompt(body.tools) : ""
 
       // ── Session resumption ─────────────────────────────────────────────
-      // If a conversation ID is provided and we have a stored SDK session,
-      // we can resume it instead of resending the full conversation history.
+      // Derive conversation ID from: headers (explicit) or conversation_label
+      // embedded in openclaw message metadata.
       const conversationId = c.req.header("x-conversation-id")
         ?? c.req.header("x-session-id")
+        ?? extractConversationLabel(messages)
         ?? null
+
       let resumeSessionId: string | undefined
       let isResuming = false
 
@@ -669,22 +737,36 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         }
       }
 
+      // Check if last user message contains images — if so, use native SDK multimodal input
+      const lastMsg = messages[messages.length - 1]!
+      const lastMsgHasImages = contentHasImages(lastMsg.content)
+
+      // promptInput: either a string (text-only) or AsyncIterable<SDKUserMessage> (multimodal)
+      let promptInput: string | AsyncIterable<any>
+      // promptText: always the text-only version for token counting and logging
+      promptText = serializeContent(lastMsg.content)
+
       if (isResuming && resumeSessionId) {
-        // Resume mode: only send the latest user message, SDK loads history from disk
-        const lastMsg = messages[messages.length - 1]!
         systemPrompt = ((systemContext || "") + toolsSection).trim() || undefined
-        prompt = serializeContent(lastMsg.content, tempFiles)
+        if (lastMsgHasImages) {
+          promptInput = createSDKUserMessage(buildNativeContent(lastMsg.content), resumeSessionId)
+          logInfo("session.resume_with_images", { reqId, conversationId })
+        } else {
+          promptInput = promptText
+        }
       } else if (messages.length === 1) {
         systemPrompt = ((systemContext || "") + toolsSection).trim() || undefined
-        prompt = serializeContent(messages[0]!.content, tempFiles)
+        promptInput = lastMsgHasImages
+          ? createSDKUserMessage(buildNativeContent(lastMsg.content))
+          : promptText
+        if (lastMsgHasImages) logInfo("request.native_images", { reqId })
       } else {
-        const lastMsg = messages[messages.length - 1]!
         const priorMsgs = messages.slice(0, -1)
 
         const contextParts = priorMsgs
           .map((m) => {
             const role = m.role === "assistant" ? "Assistant" : "User"
-            return `[${role}]\n${serializeContent(m.content, tempFiles)}`
+            return `[${role}]\n${serializeContent(m.content)}`
           })
           .join("\n\n")
 
@@ -693,7 +775,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
           ? `\n\nPrior conversation turns:\n\n${contextParts}\n\n---`
           : ""
         systemPrompt = (baseSystem + contextSection + toolsSection).trim() || undefined
-        prompt = serializeContent(lastMsg.content, tempFiles)
+
+        if (lastMsgHasImages) {
+          promptInput = createSDKUserMessage(buildNativeContent(lastMsg.content))
+          logInfo("request.native_images", { reqId })
+        } else {
+          promptInput = promptText
+        }
       }
 
       requestStarted = Date.now()
@@ -714,7 +802,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         stream,
         hasTools,
         thinking: thinking?.type,
-        promptLen: prompt.length,
+        promptLen: promptText.length,
         systemLen: systemPrompt?.length ?? 0,
         msgCount: messages.length,
         bodyBytes,
@@ -763,7 +851,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         try {
           traceStore.phase(reqId, "sdk_starting")
           let sdkEventCount = 0
-          for await (const message of query({ prompt, options: queryOpts })) {
+          for await (const message of query({ prompt: promptInput, options: queryOpts })) {
             sdkEventCount++
             resetStallTimer()
             traceStore.sdkEvent(reqId, sdkEventCount, message.type, (message as any).event?.type ?? (message as any).message?.type)
@@ -805,23 +893,25 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               sessionStore.invalidate(conversationId)
             }
             // Rebuild with full context (non-resume path)
-            const lastMsg = messages[messages.length - 1]!
+            const fbLastMsg = messages[messages.length - 1]!
             const priorMsgs = messages.slice(0, -1)
             const contextParts = priorMsgs
               .map((m) => {
                 const role = m.role === "assistant" ? "Assistant" : "User"
-                return `[${role}]\n${serializeContent(m.content, tempFiles)}`
+                return `[${role}]\n${serializeContent(m.content)}`
               })
               .join("\n\n")
             const baseSystem = systemContext || ""
             const contextSection = contextParts ? `\n\nPrior conversation turns:\n\n${contextParts}\n\n---` : ""
             const fallbackSystem = (baseSystem + contextSection + toolsSection).trim() || undefined
-            const fallbackPrompt = serializeContent(lastMsg.content, tempFiles)
+            const fallbackInput: string | AsyncIterable<any> = contentHasImages(fbLastMsg.content)
+              ? createSDKUserMessage(buildNativeContent(fbLastMsg.content))
+              : serializeContent(fbLastMsg.content)
             const fallbackOpts = buildQueryOptions(model, { partial: false, systemPrompt: fallbackSystem, abortController, thinking })
 
             logInfo("session.fallback_full_context", { reqId, conversationId })
             let sdkEventCount = 0
-            for await (const message of query({ prompt: fallbackPrompt, options: fallbackOpts })) {
+            for await (const message of query({ prompt: fallbackInput, options: fallbackOpts })) {
               sdkEventCount++
               resetStallTimer()
               traceStore.sdkEvent(reqId, sdkEventCount, message.type, (message as any).event?.type ?? (message as any).message?.type)
@@ -847,7 +937,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
           }
         } finally {
           clearStallTimer(); clearHardTimer()
-          cleanupTempFiles(tempFiles)
+          // (temp files no longer used — images passed natively)
           requestQueue.release()
           logDebug("queue.released", {
             reqId,
@@ -872,7 +962,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             id: generateId("msg_"),
             type: "message", role: "assistant", content,
             model: body.model, stop_reason: stopReason, stop_sequence: null,
-            usage: { input_tokens: roughTokens(prompt), output_tokens: roughTokens(fullText) }
+            usage: { input_tokens: roughTokens(promptText), output_tokens: roughTokens(fullText) }
           })
         }
 
@@ -884,7 +974,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
           type: "message", role: "assistant",
           content: [{ type: "text", text: fullText }],
           model: body.model, stop_reason: "end_turn", stop_sequence: null,
-          usage: { input_tokens: roughTokens(prompt), output_tokens: roughTokens(fullText) }
+          usage: { input_tokens: roughTokens(promptText), output_tokens: roughTokens(fullText) }
         })
       }
 
@@ -955,7 +1045,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               message: {
                 id: messageId, type: "message", role: "assistant", content: [],
                 model: body.model, stop_reason: null, stop_sequence: null,
-                usage: { input_tokens: roughTokens(prompt), output_tokens: 1 }
+                usage: { input_tokens: roughTokens(promptText), output_tokens: 1 }
               }
             })
 
@@ -971,7 +1061,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               let capturedSessionId: string | undefined
               try {
                 traceStore.phase(reqId, "sdk_starting")
-                for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking, resume: resumeSessionId }) })) {
+                for await (const message of query({ prompt: promptInput, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking, resume: resumeSessionId }) })) {
                   sdkEventCount++
                   lastEventAt = Date.now()
                   resetStallTimer()
@@ -1004,11 +1094,69 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                     sessionStore.set(conversationId, capturedSessionId, model, messages.length)
                   }
                 }
+              } catch (resumeErr) {
+                // Resume failed in streaming with-tools path — retry with full context
+                if (isResuming && resumeSessionId) {
+                  logWarn("session.resume_failed_stream", {
+                    reqId, conversationId, sdkSessionId: resumeSessionId,
+                    error: resumeErr instanceof Error ? resumeErr.message : String(resumeErr),
+                  })
+                  if (conversationId) {
+                    sessionStore.recordFailure(conversationId)
+                    sessionStore.invalidate(conversationId)
+                  }
+                  const fbLastMsg = messages[messages.length - 1]!
+                  const priorMsgs = messages.slice(0, -1)
+                  const contextParts = priorMsgs
+                    .map((m) => {
+                      const role = m.role === "assistant" ? "Assistant" : "User"
+                      return `[${role}]\n${serializeContent(m.content)}`
+                    })
+                    .join("\n\n")
+                  const baseSystem = systemContext || ""
+                  const contextSection = contextParts ? `\n\nPrior conversation turns:\n\n${contextParts}\n\n---` : ""
+                  const fallbackSystem = (baseSystem + contextSection + toolsSection).trim() || undefined
+                  const fallbackInput: string | AsyncIterable<any> = contentHasImages(fbLastMsg.content)
+                    ? createSDKUserMessage(buildNativeContent(fbLastMsg.content))
+                    : serializeContent(fbLastMsg.content)
+                  const fallbackOpts = buildQueryOptions(model, { partial: true, systemPrompt: fallbackSystem, abortController, thinking })
+
+                  logInfo("session.fallback_full_context_stream", { reqId, conversationId })
+                  sdkEventCount = 0
+                  for await (const message of query({ prompt: fallbackInput, options: fallbackOpts })) {
+                    sdkEventCount++
+                    lastEventAt = Date.now()
+                    resetStallTimer()
+                    const subtype = (message as any).event?.type ?? (message as any).message?.type
+                    if (message.type === "system" && (message as any).subtype === "init") {
+                      capturedSessionId = (message as any).session_id
+                    }
+                    if (message.type === "stream_event") {
+                      const ev = message.event as any
+                      if (!trace!.firstTokenAt && (ev.type === "content_block_delta" || ev.type === "content_block_start")) {
+                        traceStore.phase(reqId, "sdk_streaming")
+                      }
+                      if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
+                        fullText += ev.delta.text ?? ""
+                        traceStore.updateOutput(reqId, fullText.length)
+                        checkOutputSize(fullText.length)
+                      }
+                    }
+                    traceStore.sdkEvent(reqId, sdkEventCount, message.type, subtype)
+                  }
+                  traceStore.phase(reqId, "sdk_done")
+                  if (conversationId && capturedSessionId) {
+                    sessionStore.set(conversationId, capturedSessionId, model, messages.length)
+                    logInfo("session.recreated_after_fallback_stream", { reqId, conversationId, sdkSessionId: capturedSessionId })
+                  }
+                } else {
+                  throw resumeErr
+                }
               } finally {
                 clearInterval(stallLog)
                 clearInterval(heartbeat)
                 clearStallTimer(); clearHardTimer()
-                cleanupTempFiles(tempFiles)
+                // (temp files no longer used — images passed natively)
                 releaseQueue()
               }
 
@@ -1058,7 +1206,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             }, 15_000)
             try {
               traceStore.phase(reqId, "sdk_starting")
-              for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking, resume: resumeSessionId }) })) {
+              for await (const message of query({ prompt: promptInput, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking, resume: resumeSessionId }) })) {
                 sdkEventCount++
                 lastEventAt = Date.now()
                 resetStallTimer()
@@ -1096,11 +1244,74 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   sessionStore.set(conversationId, capturedSessionId2, model, messages.length)
                 }
               }
+            } catch (resumeErr) {
+              // Resume failed in streaming no-tools path — retry with full context
+              if (isResuming && resumeSessionId) {
+                logWarn("session.resume_failed_stream", {
+                  reqId, conversationId, sdkSessionId: resumeSessionId,
+                  error: resumeErr instanceof Error ? resumeErr.message : String(resumeErr),
+                })
+                if (conversationId) {
+                  sessionStore.recordFailure(conversationId)
+                  sessionStore.invalidate(conversationId)
+                }
+                const fbLastMsg = messages[messages.length - 1]!
+                const priorMsgs = messages.slice(0, -1)
+                const contextParts = priorMsgs
+                  .map((m) => {
+                    const role = m.role === "assistant" ? "Assistant" : "User"
+                    return `[${role}]\n${serializeContent(m.content)}`
+                  })
+                  .join("\n\n")
+                const baseSystem = systemContext || ""
+                const contextSection = contextParts ? `\n\nPrior conversation turns:\n\n${contextParts}\n\n---` : ""
+                const fallbackSystem = (baseSystem + contextSection + toolsSection).trim() || undefined
+                const fallbackInput: string | AsyncIterable<any> = contentHasImages(fbLastMsg.content)
+                  ? createSDKUserMessage(buildNativeContent(fbLastMsg.content))
+                  : serializeContent(fbLastMsg.content)
+                const fallbackOpts = buildQueryOptions(model, { partial: true, systemPrompt: fallbackSystem, abortController, thinking })
+
+                logInfo("session.fallback_full_context_stream", { reqId, conversationId })
+                sdkEventCount = 0
+                for await (const message of query({ prompt: fallbackInput, options: fallbackOpts })) {
+                  sdkEventCount++
+                  lastEventAt = Date.now()
+                  resetStallTimer()
+                  const subtype = (message as any).event?.type ?? (message as any).message?.type
+                  if (message.type === "system" && (message as any).subtype === "init") {
+                    capturedSessionId2 = (message as any).session_id
+                  }
+                  if (message.type === "stream_event") {
+                    const ev = message.event as any
+                    if (!trace!.firstTokenAt && (ev.type === "content_block_delta" || ev.type === "content_block_start")) {
+                      traceStore.phase(reqId, "sdk_streaming")
+                    }
+                    if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
+                      const text = ev.delta.text ?? ""
+                      if (text) {
+                        fullText += text
+                        hasStreamed = true
+                        traceStore.updateOutput(reqId, fullText.length)
+                        checkOutputSize(fullText.length)
+                        sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })
+                      }
+                    }
+                  }
+                  traceStore.sdkEvent(reqId, sdkEventCount, message.type, subtype)
+                }
+                traceStore.phase(reqId, "sdk_done")
+                if (conversationId && capturedSessionId2) {
+                  sessionStore.set(conversationId, capturedSessionId2, model, messages.length)
+                  logInfo("session.recreated_after_fallback_stream", { reqId, conversationId, sdkSessionId: capturedSessionId2 })
+                }
+              } else {
+                throw resumeErr
+              }
             } finally {
               clearInterval(stallLog)
               clearInterval(heartbeat)
               clearStallTimer(); clearHardTimer()
-              cleanupTempFiles(tempFiles)
+              // (temp files no longer used — images passed natively)
               releaseQueue()
             }
 
@@ -1156,7 +1367,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               sseSendErrors,
             })
 
-            cleanupTempFiles(tempFiles)
+            // (temp files no longer used — images passed natively)
             if (!clientDisconnected) {
               try {
                 sse("error", { type: "error", error: { type: errType, message: errMsg }, request_id: reqId })
