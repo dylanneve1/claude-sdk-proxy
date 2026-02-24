@@ -300,6 +300,10 @@ Use your endpoint in any Anthropic-compatible chat app:
 | **API Key** | Your `CLAUDE_PROXY_API_KEY` value |
 | **Model** | `claude-opus-4-6`, `claude-sonnet-4-6`, or `claude-haiku-4-5-20251001` |
 
+## Attribution
+
+**Built on** [rynfar/opencode-claude-max-proxy](https://github.com/rynfar/opencode-claude-max-proxy) — the original concept and foundation for this proxy implementation. This fork expands the idea into a full mock API endpoint with Anthropic and OpenAI compatibility.
+
 ## License
 
 MIT
