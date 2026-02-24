@@ -221,7 +221,23 @@ function parseToolUse(text: string): { toolCalls: ToolCall[]; textBefore: string
   while ((m = xmlRegex.exec(text)) !== null) {
     if (firstIdx < 0) firstIdx = m.index
     try {
-      const p = JSON.parse(m[1]!.trim())
+      const raw = m[1]!.trim()
+      let p: any
+      try { p = JSON.parse(raw) } catch {
+        // Repair: models often emit raw newlines in heredocs/multiline commands
+        // which are invalid inside JSON strings. Escape them only inside quoted values.
+        let fixed = "", inStr = false, esc = false
+        for (const ch of raw) {
+          if (esc) { fixed += ch; esc = false; continue }
+          if (ch === "\\") { esc = true; fixed += ch; continue }
+          if (ch === '"') { inStr = !inStr; fixed += ch; continue }
+          if (inStr && ch === "\n") { fixed += "\\n"; continue }
+          if (inStr && ch === "\r") { fixed += "\\r"; continue }
+          if (inStr && ch === "\t") { fixed += "\\t"; continue }
+          fixed += ch
+        }
+        p = JSON.parse(fixed)
+      }
       calls.push({
         id: generateId("toolu_"),
         name: String(p.name ?? ""),
