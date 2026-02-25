@@ -854,43 +854,25 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             }
           }
         } catch (resumeErr) {
-          // If resume failed, retry with full context
+          // If resume failed, start a fresh session (no history reconstruction)
           if (isResuming && resumeSessionId) {
             logWarn("session.resume_failed", {
-              reqId,
-              conversationId,
-              sdkSessionId: resumeSessionId,
+              reqId, conversationId, sdkSessionId: resumeSessionId,
               error: resumeErr instanceof Error ? resumeErr.message : String(resumeErr),
             })
             if (conversationId) {
               sessionStore.recordFailure(conversationId)
               sessionStore.invalidate(conversationId)
             }
-            // Rebuild with full context (non-resume path)
-            const fbLastMsg = messages[messages.length - 1]!
-            const priorMsgs = messages.slice(0, -1)
-            const contextParts = priorMsgs
-              .map((m) => {
-                const role = m.role === "assistant" ? "assistant" : "user"
-                return `<turn role="${role}">\n${serializeContent(m.content)}\n</turn>`
-              })
-              .join("\n\n")
-            const baseSystem = systemContext || ""
-            const contextSection = contextParts ? `\n\n<conversation_history>\n${contextParts}\n</conversation_history>\n` : ""
-            const fallbackSystem = (baseSystem + contextSection).trim() || undefined
-            const fallbackInput: string | AsyncIterable<any> = contentHasImages(fbLastMsg.content)
-              ? createSDKUserMessage(buildNativeContent(fbLastMsg.content))
-              : serializeContent(fbLastMsg.content)
-            const fallbackOpts = buildQueryOptions(model, { partial: hasTools, systemPrompt: fallbackSystem, abortController, thinking, mcpServers, canUseTool })
 
-            logInfo("session.fallback_full_context", { reqId, conversationId })
-            // Reset block accumulators for fallback
+            logInfo("session.fallback_fresh", { reqId, conversationId })
+            // Reset accumulators and retry as a brand new session
             contentBlocks.length = 0
             currentToolBlock = null
             capturedStopReason = null
             fullText = ""
             let sdkEventCount = 0
-            for await (const message of query({ prompt: fallbackInput, options: fallbackOpts })) {
+            for await (const message of query({ prompt: promptInput, options: buildQueryOptions(model, { partial: hasTools, systemPrompt, abortController, thinking, mcpServers, canUseTool }) })) {
               sdkEventCount++
               resetStallTimer()
               traceStore.sdkEvent(reqId, sdkEventCount, message.type, (message as any).event?.type ?? (message as any).message?.type)
@@ -937,10 +919,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               }
             }
             traceStore.phase(reqId, "sdk_done")
-            // Store the new session
             if (conversationId && capturedSessionId) {
               sessionStore.set(conversationId, capturedSessionId, model, messages.length)
-              logInfo("session.recreated_after_fallback", { reqId, conversationId, sdkSessionId: capturedSessionId })
+              logInfo("session.created_after_fallback", { reqId, conversationId, sdkSessionId: capturedSessionId })
             }
           } else {
             throw resumeErr
@@ -1140,7 +1121,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   }
                 }
               } catch (resumeErr) {
-                // Resume failed in streaming with-tools path — retry with full context
+                // Resume failed — start a fresh session (no history reconstruction)
                 if (isResuming && resumeSessionId) {
                   logWarn("session.resume_failed_stream", {
                     reqId, conversationId, sdkSessionId: resumeSessionId,
@@ -1150,31 +1131,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                     sessionStore.recordFailure(conversationId)
                     sessionStore.invalidate(conversationId)
                   }
-                  const fbLastMsg = messages[messages.length - 1]!
-                  const priorMsgs = messages.slice(0, -1)
-                  const contextParts = priorMsgs
-                    .map((m) => {
-                      const role = m.role === "assistant" ? "assistant" : "user"
-                      return `<turn role="${role}">\n${serializeContent(m.content)}\n</turn>`
-                    })
-                    .join("\n\n")
-                  const baseSystem = systemContext || ""
-                  const contextSection = contextParts ? `\n\n<conversation_history>\n${contextParts}\n</conversation_history>\n` : ""
-                  const fallbackSystem = (baseSystem + contextSection).trim() || undefined
-                  const fallbackInput: string | AsyncIterable<any> = contentHasImages(fbLastMsg.content)
-                    ? createSDKUserMessage(buildNativeContent(fbLastMsg.content))
-                    : serializeContent(fbLastMsg.content)
-                  const fallbackOpts = buildQueryOptions(model, { partial: true, systemPrompt: fallbackSystem, abortController, thinking, mcpServers, canUseTool })
 
-                  logInfo("session.fallback_full_context_stream", { reqId, conversationId })
-                  // Reset state for fallback
+                  logInfo("session.fallback_fresh_stream", { reqId, conversationId })
                   fullText = ""
                   blockIdx = 0
                   toolCallCount = 0
                   capturedStopReason = null
                   hasEmittedAnyBlock = false
                   sdkEventCount = 0
-                  for await (const message of query({ prompt: fallbackInput, options: fallbackOpts })) {
+                  for await (const message of query({ prompt: promptInput, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking, mcpServers, canUseTool }) })) {
                     sdkEventCount++
                     lastEventAt = Date.now()
                     resetStallTimer()
@@ -1194,7 +1159,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   traceStore.phase(reqId, "sdk_done")
                   if (conversationId && capturedSessionId) {
                     sessionStore.set(conversationId, capturedSessionId, model, messages.length)
-                    logInfo("session.recreated_after_fallback_stream", { reqId, conversationId, sdkSessionId: capturedSessionId })
+                    logInfo("session.created_after_fallback_stream", { reqId, conversationId, sdkSessionId: capturedSessionId })
                   }
                 } else {
                   throw resumeErr
@@ -1282,7 +1247,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 }
               }
             } catch (resumeErr) {
-              // Resume failed in streaming no-tools path — retry with full context
+              // Resume failed — start a fresh session (no history reconstruction)
               if (isResuming && resumeSessionId) {
                 logWarn("session.resume_failed_stream", {
                   reqId, conversationId, sdkSessionId: resumeSessionId,
@@ -1292,25 +1257,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   sessionStore.recordFailure(conversationId)
                   sessionStore.invalidate(conversationId)
                 }
-                const fbLastMsg = messages[messages.length - 1]!
-                const priorMsgs = messages.slice(0, -1)
-                const contextParts = priorMsgs
-                  .map((m) => {
-                    const role = m.role === "assistant" ? "assistant" : "user"
-                    return `<turn role="${role}">\n${serializeContent(m.content)}\n</turn>`
-                  })
-                  .join("\n\n")
-                const baseSystem = systemContext || ""
-                const contextSection = contextParts ? `\n\n<conversation_history>\n${contextParts}\n</conversation_history>\n` : ""
-                const fallbackSystem = (baseSystem + contextSection).trim() || undefined
-                const fallbackInput: string | AsyncIterable<any> = contentHasImages(fbLastMsg.content)
-                  ? createSDKUserMessage(buildNativeContent(fbLastMsg.content))
-                  : serializeContent(fbLastMsg.content)
-                const fallbackOpts = buildQueryOptions(model, { partial: true, systemPrompt: fallbackSystem, abortController, thinking })
 
-                logInfo("session.fallback_full_context_stream", { reqId, conversationId })
+                logInfo("session.fallback_fresh_stream", { reqId, conversationId })
                 sdkEventCount = 0
-                for await (const message of query({ prompt: fallbackInput, options: fallbackOpts })) {
+                for await (const message of query({ prompt: promptInput, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking }) })) {
                   sdkEventCount++
                   lastEventAt = Date.now()
                   resetStallTimer()
@@ -1339,7 +1289,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 traceStore.phase(reqId, "sdk_done")
                 if (conversationId && capturedSessionId2) {
                   sessionStore.set(conversationId, capturedSessionId2, model, messages.length)
-                  logInfo("session.recreated_after_fallback_stream", { reqId, conversationId, sdkSessionId: capturedSessionId2 })
+                  logInfo("session.created_after_fallback_stream", { reqId, conversationId, sdkSessionId: capturedSessionId2 })
                 }
               } else {
                 throw resumeErr
