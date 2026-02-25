@@ -15,6 +15,6 @@ export const DEFAULT_PROXY_CONFIG: ProxyConfig = {
   host: "127.0.0.1",
   debug: process.env.CLAUDE_PROXY_DEBUG === "1" || process.env.OPENCODE_CLAUDE_PROVIDER_DEBUG === "1",
   stallTimeoutMs: parseInt(process.env.CLAUDE_PROXY_STALL_TIMEOUT_MS ?? "120000", 10),
-  maxDurationMs: parseInt(process.env.CLAUDE_PROXY_MAX_DURATION_MS ?? "600000", 10),    // 10 minutes
+  maxDurationMs: parseInt(process.env.CLAUDE_PROXY_MAX_DURATION_MS ?? "3600000", 10),   // 1 hour
   maxOutputChars: parseInt(process.env.CLAUDE_PROXY_MAX_OUTPUT_CHARS ?? "500000", 10),  // 500KB
 }
