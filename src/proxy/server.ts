@@ -688,34 +688,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         } else {
           promptInput = promptText
         }
-      } else if (messages.length === 1) {
+      } else {
+        // Single or multi-turn: always use just the last message as prompt.
+        // The client (openclaw) manages conversation context; the proxy is stateless.
+        // Prior turns are handled by SDK session resumption when available.
         systemPrompt = (systemContext || "").trim() || undefined
         promptInput = lastMsgHasImages
           ? createSDKUserMessage(buildNativeContent(lastMsg.content))
           : promptText
         if (lastMsgHasImages) logInfo("request.native_images", { reqId })
-      } else {
-        const priorMsgs = messages.slice(0, -1)
-
-        const contextParts = priorMsgs
-          .map((m) => {
-            const role = m.role === "assistant" ? "assistant" : "user"
-            return `<turn role="${role}">\n${serializeContent(m.content)}\n</turn>`
-          })
-          .join("\n\n")
-
-        const baseSystem = systemContext || ""
-        const contextSection = contextParts
-          ? `\n\n<conversation_history>\n${contextParts}\n</conversation_history>\n`
-          : ""
-        systemPrompt = (baseSystem + contextSection).trim() || undefined
-
-        if (lastMsgHasImages) {
-          promptInput = createSDKUserMessage(buildNativeContent(lastMsg.content))
-          logInfo("request.native_images", { reqId })
-        } else {
-          promptInput = promptText
-        }
       }
 
       requestStarted = Date.now()
@@ -950,11 +931,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
           const stopReason = toolCallCount > 0 ? "tool_use" : (capturedStopReason ?? "end_turn")
 
-          // Invalidate session when tool_use present — SDK session has stale history
-          if (toolCallCount > 0 && conversationId) {
-            sessionStore.invalidate(conversationId)
-          }
-
           traceStore.complete(reqId, { outputLen: fullText.length, toolCallCount })
 
           return c.json({
@@ -1178,11 +1154,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
                 sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "..." } })
                 sse("content_block_stop", { type: "content_block_stop", index: 0 })
-              }
-
-              // Invalidate session when tool_use present — SDK session has stale history
-              if (toolCallCount > 0 && conversationId) {
-                sessionStore.invalidate(conversationId)
               }
 
               const stopReason = toolCallCount > 0 ? "tool_use" : (capturedStopReason ?? "end_turn")
