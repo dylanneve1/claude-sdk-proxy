@@ -42,7 +42,7 @@ export function jsonSchemaToZod(schema: any): z.ZodTypeAny {
     // Mixed literal types
     const literals = values.map((v: any) => z.literal(v))
     if (literals.length === 1) return literals[0]!
-    return z.union(literals as [z.ZodTypeAny, z.ZodTypeAny, ...z.ZodTypeAny[]])
+    return z.union(literals as unknown as [z.ZodTypeAny, z.ZodTypeAny, ...z.ZodTypeAny[]])
   }
 
   // const → z.literal
