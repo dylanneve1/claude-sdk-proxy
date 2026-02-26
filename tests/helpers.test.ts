@@ -343,7 +343,7 @@ describe("client tool mode detection", () => {
   })
 })
 
-// ── Rough token estimation ───────────────────────────────────────────────────
+// ── Rough token estimation (still used by count_tokens endpoint) ─────────────
 
 describe("rough token estimation", () => {
   function roughTokens(text: string): number {
@@ -361,5 +361,51 @@ describe("rough token estimation", () => {
   test("handles long text", () => {
     const text = "a".repeat(1000)
     expect(roughTokens(text)).toBe(250)
+  })
+})
+
+// ── buildUsage helper ───────────────────────────────────────────────────────
+
+describe("buildUsage", () => {
+  function buildUsage(input: number, output: number, cacheRead: number, cacheCreation: number) {
+    const usage: Record<string, number> = { input_tokens: input, output_tokens: output }
+    if (cacheRead > 0) usage.cache_read_input_tokens = cacheRead
+    if (cacheCreation > 0) usage.cache_creation_input_tokens = cacheCreation
+    return usage
+  }
+
+  test("returns basic usage when no cache tokens", () => {
+    const usage = buildUsage(100, 50, 0, 0)
+    expect(usage).toEqual({ input_tokens: 100, output_tokens: 50 })
+    expect(usage.cache_read_input_tokens).toBeUndefined()
+    expect(usage.cache_creation_input_tokens).toBeUndefined()
+  })
+
+  test("includes cache_read_input_tokens when > 0", () => {
+    const usage = buildUsage(100, 50, 80, 0)
+    expect(usage).toEqual({ input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 80 })
+  })
+
+  test("includes cache_creation_input_tokens when > 0", () => {
+    const usage = buildUsage(100, 50, 0, 20)
+    expect(usage).toEqual({ input_tokens: 100, output_tokens: 50, cache_creation_input_tokens: 20 })
+  })
+
+  test("includes both cache fields when both > 0", () => {
+    const usage = buildUsage(500, 200, 400, 100)
+    expect(usage).toEqual({
+      input_tokens: 500,
+      output_tokens: 200,
+      cache_read_input_tokens: 400,
+      cache_creation_input_tokens: 100,
+    })
+  })
+
+  test("handles zero input/output with cache tokens", () => {
+    const usage = buildUsage(0, 0, 50, 10)
+    expect(usage.input_tokens).toBe(0)
+    expect(usage.output_tokens).toBe(0)
+    expect(usage.cache_read_input_tokens).toBe(50)
+    expect(usage.cache_creation_input_tokens).toBe(10)
   })
 })

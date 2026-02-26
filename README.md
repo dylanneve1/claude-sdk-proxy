@@ -16,6 +16,8 @@ Any Anthropic/OpenAI client → claude-sdk-proxy (:3456) → Claude Agent SDK �
 - **Full tool use** — proper `tool_use` content blocks, `stop_reason: "tool_use"`, `input_json_delta` streaming
 - **Built-in agent tools** — Claude has access to Read, Write, Edit, Bash, Glob, Grep, WebFetch, WebSearch
 - **API key protection** — optional `CLAUDE_PROXY_API_KEY` to secure network-exposed instances
+- **Session persistence** — SDK sessions survive proxy restarts via `persistSession: true`; automatic reset detection when message count drops
+- **Exact usage tracking** — real `input_tokens`, `output_tokens`, `cache_read_input_tokens`, and `cache_creation_input_tokens` from the SDK (no rough estimates)
 - **Streaming SSE** — `message_start` emitted immediately; 15s heartbeat keeps connections alive
 - **Request timeout** — configurable per-request timeout (default 5 minutes)
 - **Graceful shutdown** — SIGINT/SIGTERM handlers wait for in-flight requests
@@ -159,6 +161,7 @@ Client tool mode is auto-detected when the request has a `tools` array and the s
 | `GET` | `/v1/models/:id` | Get model details |
 | `POST` | `/v1/messages` | Create a message (streaming or non-streaming) |
 | `POST` | `/v1/messages/count_tokens` | Estimate token count |
+| `DELETE` | `/sessions/:id` | Invalidate a cached session |
 | `POST` | `/v1/chat/completions` | OpenAI-compatible chat completions |
 | `GET` | `/v1/chat/models` | List models (OpenAI format) |
 
