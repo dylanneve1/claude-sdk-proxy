@@ -385,11 +385,24 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
   app.delete("/sessions/:id", (c) => {
     const id = decodeURIComponent(c.req.param("id"))
+    // Try exact match first (compound key like "convId:model")
     const stored = sessionStore.get(id)
     if (stored) {
       sessionStore.invalidate(id)
-      logInfo("session.api_reset", { conversationId: id, sdkSessionId: stored.sdkSessionId })
-      return c.json({ ok: true, invalidated: id })
+      logInfo("session.api_reset", { sessionKey: id, sdkSessionId: stored.sdkSessionId })
+      return c.json({ ok: true, invalidated: [id] })
+    }
+    // Try prefix match (invalidate all model variants for this conversationId)
+    const allSessions = sessionStore.list()
+    const matches = allSessions.filter(s => s.conversationId.startsWith(id + ":"))
+    if (matches.length > 0) {
+      const invalidated: string[] = []
+      for (const m of matches) {
+        sessionStore.invalidate(m.conversationId)
+        invalidated.push(m.conversationId)
+      }
+      logInfo("session.api_reset_prefix", { prefix: id, invalidated })
+      return c.json({ ok: true, invalidated })
     }
     return c.json({ ok: false, error: "session not found" }, 404)
   })
@@ -673,24 +686,28 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       let resumeSessionId: string | undefined
       let isResuming = false
 
-      if (conversationId) {
-        const stored = sessionStore.get(conversationId)
-        if (stored && stored.model === model) {
+      // Compound key: each model tier gets its own session per conversation
+      const sessionKey = conversationId ? `${conversationId}:${model}` : null
+
+      if (sessionKey) {
+        const stored = sessionStore.get(sessionKey)
+        if (stored) {
           if (messages.length < stored.messageCount) {
             // Client reset detected: message count dropped
             logInfo("session.reset_detected", {
-              reqId, conversationId,
+              reqId, conversationId, model,
               sdkSessionId: stored.sdkSessionId,
               storedMsgCount: stored.messageCount,
               currentMsgCount: messages.length,
             })
-            sessionStore.invalidate(conversationId)
+            sessionStore.invalidate(sessionKey)
           } else {
             resumeSessionId = stored.sdkSessionId
             isResuming = true
             logInfo("session.resuming", {
               reqId,
               conversationId,
+              model,
               sdkSessionId: resumeSessionId,
               storedMsgCount: stored.messageCount,
               currentMsgCount: messages.length,
@@ -765,7 +782,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
           conversationId,
           sdkSessionId: resumeSessionId,
           isResuming,
-          resumeCount: isResuming ? sessionStore.get(conversationId)?.resumeCount : undefined,
+          resumeCount: isResuming ? sessionStore.get(sessionKey!)?.resumeCount : undefined,
         })
       }
 
@@ -890,10 +907,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
           // Store session mapping for future resumption
           if (conversationId && capturedSessionId) {
             if (isResuming) {
-              sessionStore.recordResume(conversationId, messages.length)
+              sessionStore.recordResume(sessionKey!, messages.length)
               logInfo("session.resumed_ok", { reqId, conversationId, sdkSessionId: capturedSessionId })
             } else {
-              sessionStore.set(conversationId, capturedSessionId, model, messages.length)
+              sessionStore.set(sessionKey!, capturedSessionId, model, messages.length)
               logInfo("session.created", { reqId, conversationId, sdkSessionId: capturedSessionId })
             }
           }
@@ -905,8 +922,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               error: resumeErr instanceof Error ? resumeErr.message : String(resumeErr),
             })
             if (conversationId) {
-              sessionStore.recordFailure(conversationId)
-              sessionStore.invalidate(conversationId)
+              sessionStore.recordFailure(sessionKey!)
+              sessionStore.invalidate(sessionKey!)
             }
 
             logInfo("session.fallback_fresh", { reqId, conversationId })
@@ -982,7 +999,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             }
             traceStore.phase(reqId, "sdk_done")
             if (conversationId && capturedSessionId) {
-              sessionStore.set(conversationId, capturedSessionId, model, messages.length)
+              sessionStore.set(sessionKey!, capturedSessionId, model, messages.length)
               logInfo("session.created_after_fallback", { reqId, conversationId, sdkSessionId: capturedSessionId })
             }
           } else {
@@ -1203,9 +1220,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 // Store session mapping
                 if (conversationId && capturedSessionId) {
                   if (isResuming) {
-                    sessionStore.recordResume(conversationId, messages.length)
+                    sessionStore.recordResume(sessionKey!, messages.length)
                   } else {
-                    sessionStore.set(conversationId, capturedSessionId, model, messages.length)
+                    sessionStore.set(sessionKey!, capturedSessionId, model, messages.length)
                   }
                 }
               } catch (resumeErr) {
@@ -1216,8 +1233,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                     error: resumeErr instanceof Error ? resumeErr.message : String(resumeErr),
                   })
                   if (conversationId) {
-                    sessionStore.recordFailure(conversationId)
-                    sessionStore.invalidate(conversationId)
+                    sessionStore.recordFailure(sessionKey!)
+                    sessionStore.invalidate(sessionKey!)
                   }
 
                   logInfo("session.fallback_fresh_stream", { reqId, conversationId })
@@ -1256,7 +1273,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   }
                   traceStore.phase(reqId, "sdk_done")
                   if (conversationId && capturedSessionId) {
-                    sessionStore.set(conversationId, capturedSessionId, model, messages.length)
+                    sessionStore.set(sessionKey!, capturedSessionId, model, messages.length)
                     logInfo("session.created_after_fallback_stream", { reqId, conversationId, sdkSessionId: capturedSessionId })
                   }
                 } else {
@@ -1363,9 +1380,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               // Store session mapping
               if (conversationId && capturedSessionId2) {
                 if (isResuming) {
-                  sessionStore.recordResume(conversationId, messages.length)
+                  sessionStore.recordResume(sessionKey!, messages.length)
                 } else {
-                  sessionStore.set(conversationId, capturedSessionId2, model, messages.length)
+                  sessionStore.set(sessionKey!, capturedSessionId2, model, messages.length)
                 }
               }
             } catch (resumeErr) {
@@ -1376,8 +1393,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   error: resumeErr instanceof Error ? resumeErr.message : String(resumeErr),
                 })
                 if (conversationId) {
-                  sessionStore.recordFailure(conversationId)
-                  sessionStore.invalidate(conversationId)
+                  sessionStore.recordFailure(sessionKey!)
+                  sessionStore.invalidate(sessionKey!)
                 }
 
                 logInfo("session.fallback_fresh_stream", { reqId, conversationId })
@@ -1433,7 +1450,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 }
                 traceStore.phase(reqId, "sdk_done")
                 if (conversationId && capturedSessionId2) {
-                  sessionStore.set(conversationId, capturedSessionId2, model, messages.length)
+                  sessionStore.set(sessionKey!, capturedSessionId2, model, messages.length)
                   logInfo("session.created_after_fallback_stream", { reqId, conversationId, sdkSessionId: capturedSessionId2 })
                 }
               } else {
