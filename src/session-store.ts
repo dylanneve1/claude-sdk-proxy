@@ -43,11 +43,9 @@ class SessionStore {
   constructor(ttlMs = DEFAULT_TTL_MS) {
     this.ttlMs = ttlMs
     this.load()
-    // Clear all sessions on startup — SDK sessions don't survive proxy restarts
+    // SDK sessions persist on disk via persistSession: true — keep our mappings
     if (this.sessions.size > 0) {
-      logInfo("session-store.startup_clear", { cleared: this.sessions.size })
-      this.sessions.clear()
-      this.save()
+      logInfo("session-store.loaded_sessions", { count: this.sessions.size })
     }
   }
 
@@ -87,10 +85,11 @@ class SessionStore {
   }
 
   /** Record a successful resume */
-  recordResume(conversationId: string): void {
+  recordResume(conversationId: string, messageCount: number): void {
     const entry = this.sessions.get(conversationId)
     if (entry) {
       entry.resumeCount++
+      entry.messageCount = messageCount
       entry.lastUsed = Date.now()
       this.save()
     }

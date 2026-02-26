@@ -213,6 +213,13 @@ function roughTokens(text: string): number {
   return Math.ceil((text ?? "").length / 4)
 }
 
+function buildUsage(input: number, output: number, cacheRead: number, cacheCreation: number) {
+  const usage: Record<string, number> = { input_tokens: input, output_tokens: output }
+  if (cacheRead > 0) usage.cache_read_input_tokens = cacheRead
+  if (cacheCreation > 0) usage.cache_creation_input_tokens = cacheCreation
+  return usage
+}
+
 // ── Conversation label extraction ────────────────────────────────────────────
 // Openclaw embeds "Conversation info (untrusted metadata)" in the last user
 // message containing a JSON block with conversation_label. Extract it to use
@@ -374,6 +381,17 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
   app.get("/sessions/cleanup", (c) => {
     const result = sessionStore.cleanup()
     return c.json(result)
+  })
+
+  app.delete("/sessions/:id", (c) => {
+    const id = decodeURIComponent(c.req.param("id"))
+    const stored = sessionStore.get(id)
+    if (stored) {
+      sessionStore.invalidate(id)
+      logInfo("session.api_reset", { conversationId: id, sdkSessionId: stored.sdkSessionId })
+      return c.json({ ok: true, invalidated: id })
+    }
+    return c.json({ ok: false, error: "session not found" }, 404)
   })
 
   app.get("/debug/traces", (c) => {
@@ -655,19 +673,30 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       let resumeSessionId: string | undefined
       let isResuming = false
 
-      if (conversationId && messages.length > 1) {
+      if (conversationId) {
         const stored = sessionStore.get(conversationId)
         if (stored && stored.model === model) {
-          resumeSessionId = stored.sdkSessionId
-          isResuming = true
-          logInfo("session.resuming", {
-            reqId,
-            conversationId,
-            sdkSessionId: resumeSessionId,
-            storedMsgCount: stored.messageCount,
-            currentMsgCount: messages.length,
-            resumeCount: stored.resumeCount,
-          })
+          if (messages.length < stored.messageCount) {
+            // Client reset detected: message count dropped
+            logInfo("session.reset_detected", {
+              reqId, conversationId,
+              sdkSessionId: stored.sdkSessionId,
+              storedMsgCount: stored.messageCount,
+              currentMsgCount: messages.length,
+            })
+            sessionStore.invalidate(conversationId)
+          } else {
+            resumeSessionId = stored.sdkSessionId
+            isResuming = true
+            logInfo("session.resuming", {
+              reqId,
+              conversationId,
+              sdkSessionId: resumeSessionId,
+              storedMsgCount: stored.messageCount,
+              currentMsgCount: messages.length,
+              resumeCount: stored.resumeCount,
+            })
+          }
         }
       }
 
@@ -679,10 +708,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       let promptInput: string | AsyncIterable<any>
       // promptText: always the text-only version for token counting and logging
       promptText = serializeContent(lastMsg.content)
-      // Track real usage from SDK stream events (fallback to rough estimate)
-      const roughContextTokens = roughTokens((systemContext || "") + messages.map(m => serializeContent(m.content)).join("\n"))
+      // Track real usage from SDK stream events
       let sdkInputTokens = 0
       let sdkOutputTokens = 0
+      let sdkCacheReadTokens = 0
+      let sdkCacheCreationTokens = 0
 
       if (isResuming && resumeSessionId) {
         systemPrompt = (systemContext || "").trim() || undefined
@@ -782,6 +812,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             if (message.type === "system" && (message as any).subtype === "init") {
               capturedSessionId = (message as any).session_id
             }
+            if (message.type === "result") {
+              const r = message as any
+              if (r.session_id) capturedSessionId = r.session_id
+              if (r.usage) {
+                sdkInputTokens = r.usage.input_tokens ?? sdkInputTokens
+                sdkOutputTokens = r.usage.output_tokens ?? sdkOutputTokens
+                sdkCacheReadTokens = r.usage.cache_read_input_tokens ?? sdkCacheReadTokens
+                sdkCacheCreationTokens = r.usage.cache_creation_input_tokens ?? sdkCacheCreationTokens
+              }
+            }
             if (hasTools && message.type === "stream_event") {
               const ev = (message as any).event as any
               if (ev.type === "content_block_start") {
@@ -820,6 +860,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 if (ev.usage?.output_tokens) sdkOutputTokens = ev.usage.output_tokens
               } else if (ev.type === "message_start" && ev.message?.usage) {
                 if (ev.message.usage.input_tokens) sdkInputTokens = ev.message.usage.input_tokens
+                if (ev.message.usage.cache_read_input_tokens) sdkCacheReadTokens = ev.message.usage.cache_read_input_tokens
+                if (ev.message.usage.cache_creation_input_tokens) sdkCacheCreationTokens = ev.message.usage.cache_creation_input_tokens
               }
             } else if (!hasTools && message.type === "assistant") {
               let turnText = ""
@@ -838,7 +880,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
           // Store session mapping for future resumption
           if (conversationId && capturedSessionId) {
             if (isResuming) {
-              sessionStore.recordResume(conversationId)
+              sessionStore.recordResume(conversationId, messages.length)
               logInfo("session.resumed_ok", { reqId, conversationId, sdkSessionId: capturedSessionId })
             } else {
               sessionStore.set(conversationId, capturedSessionId, model, messages.length)
@@ -870,6 +912,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               traceStore.sdkEvent(reqId, sdkEventCount, message.type, (message as any).event?.type ?? (message as any).message?.type)
               if (message.type === "system" && (message as any).subtype === "init") {
                 capturedSessionId = (message as any).session_id
+              }
+              if (message.type === "result") {
+                const r = message as any
+                if (r.session_id) capturedSessionId = r.session_id
+                if (r.usage) {
+                  sdkInputTokens = r.usage.input_tokens ?? sdkInputTokens
+                  sdkOutputTokens = r.usage.output_tokens ?? sdkOutputTokens
+                  sdkCacheReadTokens = r.usage.cache_read_input_tokens ?? sdkCacheReadTokens
+                  sdkCacheCreationTokens = r.usage.cache_creation_input_tokens ?? sdkCacheCreationTokens
+                }
               }
               if (hasTools && message.type === "stream_event") {
                 const ev = (message as any).event as any
@@ -904,6 +956,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   if (ev.usage?.output_tokens) sdkOutputTokens = ev.usage.output_tokens
                 } else if (ev.type === "message_start" && ev.message?.usage) {
                   if (ev.message.usage.input_tokens) sdkInputTokens = ev.message.usage.input_tokens
+                  if (ev.message.usage.cache_read_input_tokens) sdkCacheReadTokens = ev.message.usage.cache_read_input_tokens
+                  if (ev.message.usage.cache_creation_input_tokens) sdkCacheCreationTokens = ev.message.usage.cache_creation_input_tokens
                 }
               } else if (!hasTools && message.type === "assistant") {
                 let turnText = ""
@@ -954,11 +1008,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             id: generateId("msg_"),
             type: "message", role: "assistant", content,
             model: body.model, stop_reason: stopReason, stop_sequence: null,
-            usage: { input_tokens: sdkInputTokens || roughContextTokens, output_tokens: sdkOutputTokens || roughTokens(fullText) }
+            usage: buildUsage(sdkInputTokens, sdkOutputTokens, sdkCacheReadTokens, sdkCacheCreationTokens)
           })
         }
 
-        logDebug("usage.tokens", { reqId, sdkInput: sdkInputTokens, sdkOutput: sdkOutputTokens, roughInput: roughContextTokens, roughOutput: roughTokens(fullText) })
+        logDebug("usage.tokens", { reqId, sdkInput: sdkInputTokens, sdkOutput: sdkOutputTokens, cacheRead: sdkCacheReadTokens, cacheCreation: sdkCacheCreationTokens })
 
         if (!fullText || !fullText.trim()) fullText = "..."
         traceStore.complete(reqId, { outputLen: fullText.length })
@@ -968,7 +1022,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
           type: "message", role: "assistant",
           content: [{ type: "text", text: fullText }],
           model: body.model, stop_reason: "end_turn", stop_sequence: null,
-          usage: { input_tokens: sdkInputTokens || roughContextTokens, output_tokens: sdkOutputTokens || roughTokens(fullText) }
+          usage: buildUsage(sdkInputTokens, sdkOutputTokens, sdkCacheReadTokens, sdkCacheCreationTokens)
         })
       }
 
@@ -1044,7 +1098,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   message: {
                     id: messageId, type: "message", role: "assistant", content: [],
                     model: body.model, stop_reason: null, stop_sequence: null,
-                    usage: { input_tokens: sdkInputTokens || roughContextTokens, output_tokens: 1 }
+                    usage: buildUsage(sdkInputTokens, 1, sdkCacheReadTokens, sdkCacheCreationTokens)
                   }
                 })
               }
@@ -1069,6 +1123,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               const forwardStreamEvent = (ev: any) => {
                 if (ev.type === "message_start" && ev.message?.usage) {
                   if (ev.message.usage.input_tokens) sdkInputTokens = ev.message.usage.input_tokens
+                  if (ev.message.usage.cache_read_input_tokens) sdkCacheReadTokens = ev.message.usage.cache_read_input_tokens
+                  if (ev.message.usage.cache_creation_input_tokens) sdkCacheCreationTokens = ev.message.usage.cache_creation_input_tokens
                   emitMessageStart()
                   return
                 }
@@ -1111,6 +1167,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   if (message.type === "system" && (message as any).subtype === "init") {
                     capturedSessionId = (message as any).session_id
                   }
+                  if (message.type === "result") {
+                    const r = message as any
+                    if (r.session_id) capturedSessionId = r.session_id
+                    if (r.usage) {
+                      sdkInputTokens = r.usage.input_tokens ?? sdkInputTokens
+                      sdkOutputTokens = r.usage.output_tokens ?? sdkOutputTokens
+                      sdkCacheReadTokens = r.usage.cache_read_input_tokens ?? sdkCacheReadTokens
+                      sdkCacheCreationTokens = r.usage.cache_creation_input_tokens ?? sdkCacheCreationTokens
+                    }
+                  }
                   if (message.type === "stream_event") {
                     const ev = (message as any).event as any
                     if (!trace!.firstTokenAt && (ev.type === "content_block_delta" || ev.type === "content_block_start")) {
@@ -1125,7 +1191,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 // Store session mapping
                 if (conversationId && capturedSessionId) {
                   if (isResuming) {
-                    sessionStore.recordResume(conversationId)
+                    sessionStore.recordResume(conversationId, messages.length)
                   } else {
                     sessionStore.set(conversationId, capturedSessionId, model, messages.length)
                   }
@@ -1156,6 +1222,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                     const subtype = (message as any).event?.type ?? (message as any).message?.type
                     if (message.type === "system" && (message as any).subtype === "init") {
                       capturedSessionId = (message as any).session_id
+                    }
+                    if (message.type === "result") {
+                      const r = message as any
+                      if (r.session_id) capturedSessionId = r.session_id
+                      if (r.usage) {
+                        sdkInputTokens = r.usage.input_tokens ?? sdkInputTokens
+                        sdkOutputTokens = r.usage.output_tokens ?? sdkOutputTokens
+                        sdkCacheReadTokens = r.usage.cache_read_input_tokens ?? sdkCacheReadTokens
+                        sdkCacheCreationTokens = r.usage.cache_creation_input_tokens ?? sdkCacheCreationTokens
+                      }
                     }
                     if (message.type === "stream_event") {
                       const ev = (message as any).event as any
@@ -1194,7 +1270,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               }
 
               const stopReason = toolCallCount > 0 ? "tool_use" : (capturedStopReason ?? "end_turn")
-              sse("message_delta", { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: sdkOutputTokens || roughTokens(fullText) } })
+              sse("message_delta", { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: sdkOutputTokens } })
               sse("message_stop", { type: "message_stop" })
               controller.close()
 
@@ -1225,11 +1301,23 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 if (message.type === "system" && (message as any).subtype === "init") {
                   capturedSessionId2 = (message as any).session_id
                 }
+                if (message.type === "result") {
+                  const r = message as any
+                  if (r.session_id) capturedSessionId2 = r.session_id
+                  if (r.usage) {
+                    sdkInputTokens = r.usage.input_tokens ?? sdkInputTokens
+                    sdkOutputTokens = r.usage.output_tokens ?? sdkOutputTokens
+                    sdkCacheReadTokens = r.usage.cache_read_input_tokens ?? sdkCacheReadTokens
+                    sdkCacheCreationTokens = r.usage.cache_creation_input_tokens ?? sdkCacheCreationTokens
+                  }
+                }
                 if (message.type === "stream_event") {
                   const ev = message.event as any
                   // Capture usage from SDK message_start (real input tokens)
-                  if (ev.type === "message_start" && ev.message?.usage?.input_tokens) {
-                    sdkInputTokens = ev.message.usage.input_tokens
+                  if (ev.type === "message_start" && ev.message?.usage) {
+                    if (ev.message.usage.input_tokens) sdkInputTokens = ev.message.usage.input_tokens
+                    if (ev.message.usage.cache_read_input_tokens) sdkCacheReadTokens = ev.message.usage.cache_read_input_tokens
+                    if (ev.message.usage.cache_creation_input_tokens) sdkCacheCreationTokens = ev.message.usage.cache_creation_input_tokens
                     emitMessageStart()
                   }
                   // Detect first content event BEFORE sdkEvent records it
@@ -1262,7 +1350,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               // Store session mapping
               if (conversationId && capturedSessionId2) {
                 if (isResuming) {
-                  sessionStore.recordResume(conversationId)
+                  sessionStore.recordResume(conversationId, messages.length)
                 } else {
                   sessionStore.set(conversationId, capturedSessionId2, model, messages.length)
                 }
@@ -1289,10 +1377,22 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   if (message.type === "system" && (message as any).subtype === "init") {
                     capturedSessionId2 = (message as any).session_id
                   }
+                  if (message.type === "result") {
+                    const r = message as any
+                    if (r.session_id) capturedSessionId2 = r.session_id
+                    if (r.usage) {
+                      sdkInputTokens = r.usage.input_tokens ?? sdkInputTokens
+                      sdkOutputTokens = r.usage.output_tokens ?? sdkOutputTokens
+                      sdkCacheReadTokens = r.usage.cache_read_input_tokens ?? sdkCacheReadTokens
+                      sdkCacheCreationTokens = r.usage.cache_creation_input_tokens ?? sdkCacheCreationTokens
+                    }
+                  }
                   if (message.type === "stream_event") {
                     const ev = message.event as any
-                    if (ev.type === "message_start" && ev.message?.usage?.input_tokens) {
-                      sdkInputTokens = ev.message.usage.input_tokens
+                    if (ev.type === "message_start" && ev.message?.usage) {
+                      if (ev.message.usage.input_tokens) sdkInputTokens = ev.message.usage.input_tokens
+                      if (ev.message.usage.cache_read_input_tokens) sdkCacheReadTokens = ev.message.usage.cache_read_input_tokens
+                      if (ev.message.usage.cache_creation_input_tokens) sdkCacheCreationTokens = ev.message.usage.cache_creation_input_tokens
                       emitMessageStart()
                     }
                     if (!trace!.firstTokenAt && (ev.type === "content_block_delta" || ev.type === "content_block_start")) {
@@ -1346,7 +1446,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             }
 
             sse("content_block_stop", { type: "content_block_stop", index: 0 })
-            sse("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: sdkOutputTokens || roughTokens(fullText) } })
+            sse("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: sdkOutputTokens } })
             sse("message_stop", { type: "message_stop" })
             controller.close()
 
