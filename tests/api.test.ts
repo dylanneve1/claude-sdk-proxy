@@ -352,6 +352,19 @@ describe("API key validation", () => {
   })
 })
 
+// ── Session management ───────────────────────────────────────────────────────
+
+describe("DELETE /sessions/:id", () => {
+  test("returns 404 for non-existent session", async () => {
+    const { status, body } = await json("/sessions/nonexistent-session-id", {
+      method: "DELETE",
+    })
+    expect(status).toBe(404)
+    expect(body.ok).toBe(false)
+    expect(body.error).toBe("session not found")
+  })
+})
+
 // ── 404 ──────────────────────────────────────────────────────────────────────
 
 describe("Unknown routes", () => {
