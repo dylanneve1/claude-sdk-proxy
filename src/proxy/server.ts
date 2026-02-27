@@ -4,7 +4,7 @@ import { query } from "@anthropic-ai/claude-agent-sdk"
 import type { Context } from "hono"
 import type { ProxyConfig } from "./types"
 import { DEFAULT_PROXY_CONFIG } from "./types"
-import { logInfo, logWarn, logError, logDebug, LOG_DIR } from "../logger"
+import { logInfo, logWarn, logError, logDebug, LOG_DIR, dumpSessionContext } from "../logger"
 import { traceStore } from "../trace"
 import { sessionStore } from "../session-store"
 import { createToolMcpServer } from "../mcpTools"
@@ -87,6 +87,16 @@ class RequestQueue {
 }
 
 const requestQueue = new RequestQueue()
+
+// ── Last-context cache (per conversation) for before/after dumps on reset/compaction ──
+interface LastContext {
+  systemPrompt: string
+  messages: Array<{ role: string; content: string | Array<any> }>
+  model: string
+  ts: number
+}
+const lastContextCache = new Map<string, LastContext>()
+const MAX_CONTEXT_CACHE = 100
 
 function mapModelToClaudeModel(model: string): "sonnet" | "opus" | "haiku" {
   if (model.includes("opus")) return "opus"
@@ -199,8 +209,8 @@ function createSDKUserMessage(content: Array<any>, sessionId?: string): AsyncIte
 // ── Client tool-use support (native MCP) ────────────────────────────────────
 // Tool definitions from the client are converted to native MCP tools via
 // createToolMcpServer(). The SDK generates proper tool_use content blocks
-// instead of text-based XML. canUseTool denies all execution since the
-// client handles tool execution.
+// instead of text-based XML. We abort the SDK at message_delta (after all
+// content blocks are complete) to prevent internal MCP tool execution.
 
 // The SDK prefixes MCP tool names with "mcp__{server-name}__".
 // Strip this prefix so clients see the original tool names they sent.
@@ -267,7 +277,6 @@ function buildQueryOptions(
     thinking?: { type: "adaptive" } | { type: "enabled"; budgetTokens?: number } | { type: "disabled" }
     resume?: string
     mcpServers?: Record<string, any>
-    canUseTool?: (toolName: string, input: Record<string, unknown>, options: any) => Promise<any>
   } = {}
 ) {
   return {
@@ -285,7 +294,6 @@ function buildQueryOptions(
     ...(opts.systemPrompt ? { systemPrompt: opts.systemPrompt } : {}),
     ...(opts.resume ? { resume: opts.resume } : {}),
     ...(opts.mcpServers ? { mcpServers: opts.mcpServers } : {}),
-    ...(opts.canUseTool ? { canUseTool: opts.canUseTool } : {}),
   }
 }
 
@@ -658,9 +666,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       // Create MCP server for native tool calling (if client sent tools)
       const mcpServer = hasTools ? createToolMcpServer(body.tools) : null
       const mcpServers = mcpServer ? { "proxy-tools": mcpServer } : undefined
-      const canUseTool = hasTools
-        ? async () => ({ behavior: "deny" as const, message: "Tool execution handled by client" })
-        : undefined
+      // Tool abort strategy: We use bypassPermissions so canUseTool is never called.
+      // Instead, we abort the SDK when we see message_delta with stop_reason AND
+      // tool blocks have been emitted. At that point, ALL content blocks are complete
+      // (Anthropic API guarantees message_delta comes after all content_block_stop).
+      // This prevents the SDK from doing internal MCP tool execution + second turn.
 
       // ── Session resumption ─────────────────────────────────────────────
       // Derive conversation ID from: headers (explicit) or conversation_label
@@ -669,6 +679,17 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         ?? c.req.header("x-session-id")
         ?? extractConversationLabel(messages)
         ?? null
+
+      if (conversationId) {
+        logDebug("session.conversation_id_found", {
+          reqId, conversationId,
+          source: c.req.header("x-conversation-id") ? "header:x-conversation-id"
+            : c.req.header("x-session-id") ? "header:x-session-id"
+            : "message_extraction",
+        })
+      } else {
+        logDebug("session.no_conversation_id", { reqId, msgCount: messages.length })
+      }
 
       let resumeSessionId: string | undefined
       let isResuming = false
@@ -685,7 +706,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             // (compacted) context actually reduces token usage.
             // The SDK session caches all old turns; resuming it would
             // defeat compaction entirely.
-            if (messages.length <= 2) {
+            const event = messages.length <= 2 ? "reset" : "compaction"
+            if (event === "reset") {
               logInfo("session.likely_reset", {
                 reqId, conversationId, model,
                 sdkSessionId: stored.sdkSessionId,
@@ -702,6 +724,30 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 dropped: -countDelta,
               })
             }
+            // Dump full session context (before + after) for debugging
+            const prevContext = lastContextCache.get(conversationId)
+            const dumpPath = dumpSessionContext(reqId, {
+              event: `session.${event}`,
+              conversationId,
+              model,
+              sdkSessionId: stored.sdkSessionId,
+              storedMsgCount: stored.messageCount,
+              currentMsgCount: messages.length,
+              before: prevContext ? {
+                systemPrompt: prevContext.systemPrompt,
+                messages: prevContext.messages,
+                model: prevContext.model,
+                msgCount: prevContext.messages.length,
+                capturedAt: new Date(prevContext.ts).toISOString(),
+              } : null,
+              after: {
+                systemPrompt: systemContext,
+                messages,
+                model,
+                msgCount: messages.length,
+              },
+            })
+            logInfo("session.context_dumped", { reqId, event, path: dumpPath, msgCount: messages.length, hasBefore: !!prevContext })
             sessionStore.invalidate(conversationId)
           } else {
             resumeSessionId = stored.sdkSessionId
@@ -716,6 +762,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               countDelta,
             })
           }
+        }
+      }
+
+      // Update last-context cache for this conversation (used in before/after dumps)
+      if (conversationId) {
+        lastContextCache.set(conversationId, { systemPrompt: systemContext, messages, model, ts: Date.now() })
+        // Evict oldest if cache is too large
+        if (lastContextCache.size > MAX_CONTEXT_CACHE) {
+          const oldest = [...lastContextCache.entries()].sort((a, b) => a[1].ts - b[1].ts)[0]
+          if (oldest) lastContextCache.delete(oldest[0])
         }
       }
 
@@ -825,14 +881,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       if (!stream) {
         let fullText = ""
         let capturedSessionId: string | undefined
-        const queryOpts = buildQueryOptions(model, { partial: hasTools, systemPrompt, abortController, thinking, resume: resumeSessionId, mcpServers, canUseTool })
+        const queryOpts = buildQueryOptions(model, { partial: hasTools, systemPrompt, abortController, thinking, resume: resumeSessionId, mcpServers })
         // For tool mode: capture native content blocks from stream events
         const contentBlocks: any[] = []
         let currentToolBlock: { id: string; name: string; jsonAccum: string } | null = null
         let capturedStopReason: string | null = null
+        let sdkEventCount = 0
         try {
           traceStore.phase(reqId, "sdk_starting")
-          let sdkEventCount = 0
           for await (const message of query({ prompt: promptInput, options: queryOpts })) {
             sdkEventCount++
             resetStallTimer()
@@ -887,6 +943,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               } else if (ev.type === "message_delta") {
                 if (ev.delta?.stop_reason) capturedStopReason = ev.delta.stop_reason
                 if (ev.usage?.output_tokens) sdkOutputTokens = ev.usage.output_tokens
+                // Abort after all content blocks are complete (message_delta comes after all content_block_stop per API spec)
+                if (contentBlocks.some((b: any) => b.type === "tool_use") && !abortController.signal.aborted) {
+                  logInfo("sdk.abort_after_complete_response", { reqId, contentBlockCount: contentBlocks.length, stopReason: capturedStopReason })
+                  abortController.abort()
+                }
               } else if (ev.type === "message_start" && ev.message?.usage) {
                 if (ev.message.usage.input_tokens) sdkInputTokens = ev.message.usage.input_tokens
                 if (ev.message.usage.cache_read_input_tokens) sdkCacheReadTokens = ev.message.usage.cache_read_input_tokens
@@ -905,6 +966,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             }
           }
           traceStore.phase(reqId, "sdk_done")
+          logInfo("request.content_summary", {
+            reqId, hasTools,
+            contentBlockCount: contentBlocks.length,
+            contentBlockTypes: contentBlocks.map((b: any) => b.type),
+            toolNames: contentBlocks.filter((b: any) => b.type === "tool_use").map((b: any) => b.name),
+            textLength: fullText.length,
+            stopReason: capturedStopReason,
+            sdkEventCount,
+          })
 
           // Store session mapping for future resumption
           if (conversationId && capturedSessionId) {
@@ -917,8 +987,27 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             }
           }
         } catch (resumeErr) {
-          // If resume failed, start a fresh session (no history reconstruction)
-          if (isResuming && resumeSessionId) {
+          // Aborted SDK after message_delta (all blocks complete) — not an error
+          if (abortController.signal.aborted && contentBlocks.some((b: any) => b.type === "tool_use")) {
+            traceStore.phase(reqId, "sdk_done")
+            logInfo("sdk.aborted_after_tool_call_nonstream", { reqId, contentBlocks: contentBlocks.length })
+            logInfo("request.content_summary", {
+              reqId, hasTools,
+              contentBlockCount: contentBlocks.length,
+              contentBlockTypes: contentBlocks.map((b: any) => b.type),
+              toolNames: contentBlocks.filter((b: any) => b.type === "tool_use").map((b: any) => b.name),
+              textLength: fullText.length,
+              stopReason: capturedStopReason,
+              sdkEventCount,
+            })
+            if (conversationId && capturedSessionId) {
+              if (isResuming) {
+                sessionStore.recordResume(conversationId!, messages.length, isCompacted)
+              } else {
+                sessionStore.set(conversationId!, capturedSessionId, model, messages.length)
+              }
+            }
+          } else if (isResuming && resumeSessionId) {
             logWarn("session.resume_failed", {
               reqId, conversationId, sdkSessionId: resumeSessionId,
               error: resumeErr instanceof Error ? resumeErr.message : String(resumeErr),
@@ -934,75 +1023,111 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             currentToolBlock = null
             capturedStopReason = null
             fullText = ""
-            let sdkEventCount = 0
-            for await (const message of query({ prompt: promptInput, options: buildQueryOptions(model, { partial: hasTools, systemPrompt, abortController, thinking, mcpServers, canUseTool }) })) {
-              sdkEventCount++
-              resetStallTimer()
-              traceStore.sdkEvent(reqId, sdkEventCount, message.type, (message as any).event?.type ?? (message as any).message?.type)
-              if (message.type === "system" && (message as any).subtype === "init") {
-                capturedSessionId = (message as any).session_id
-              }
-              if (message.type === "result") {
-                const r = message as any
-                if (r.session_id) capturedSessionId = r.session_id
-                if (r.usage) {
-                  sdkInputTokens = r.usage.input_tokens ?? sdkInputTokens
-                  sdkOutputTokens = r.usage.output_tokens ?? sdkOutputTokens
-                  sdkCacheReadTokens = r.usage.cache_read_input_tokens ?? sdkCacheReadTokens
-                  sdkCacheCreationTokens = r.usage.cache_creation_input_tokens ?? sdkCacheCreationTokens
+            sdkEventCount = 0
+            const fallbackAbort = new AbortController()
+            try {
+              for await (const message of query({ prompt: promptInput, options: buildQueryOptions(model, { partial: hasTools, systemPrompt, abortController: fallbackAbort, thinking, mcpServers }) })) {
+                sdkEventCount++
+                resetStallTimer()
+                traceStore.sdkEvent(reqId, sdkEventCount, message.type, (message as any).event?.type ?? (message as any).message?.type)
+                if (message.type === "system" && (message as any).subtype === "init") {
+                  capturedSessionId = (message as any).session_id
                 }
-              }
-              if (hasTools && message.type === "stream_event") {
-                const ev = (message as any).event as any
-                if (ev.type === "content_block_start") {
-                  const cb = ev.content_block
-                  if (cb?.type === "tool_use") {
-                    currentToolBlock = { id: cb.id, name: stripMcpPrefix(cb.name), jsonAccum: "" }
-                  } else if (cb?.type === "text") {
-                    contentBlocks.push({ type: "text", text: "" })
+                if (message.type === "result") {
+                  const r = message as any
+                  if (r.session_id) capturedSessionId = r.session_id
+                  if (r.usage) {
+                    sdkInputTokens = r.usage.input_tokens ?? sdkInputTokens
+                    sdkOutputTokens = r.usage.output_tokens ?? sdkOutputTokens
+                    sdkCacheReadTokens = r.usage.cache_read_input_tokens ?? sdkCacheReadTokens
+                    sdkCacheCreationTokens = r.usage.cache_creation_input_tokens ?? sdkCacheCreationTokens
                   }
-                } else if (ev.type === "content_block_delta") {
-                  if (ev.delta?.type === "text_delta") {
-                    const lastText = contentBlocks[contentBlocks.length - 1]
-                    if (lastText?.type === "text") {
-                      lastText.text += ev.delta.text ?? ""
-                    } else {
-                      contentBlocks.push({ type: "text", text: ev.delta.text ?? "" })
+                }
+                if (hasTools && message.type === "stream_event") {
+                  const ev = (message as any).event as any
+                  if (ev.type === "content_block_start") {
+                    const cb = ev.content_block
+                    if (cb?.type === "tool_use") {
+                      currentToolBlock = { id: cb.id, name: stripMcpPrefix(cb.name), jsonAccum: "" }
+                    } else if (cb?.type === "text") {
+                      contentBlocks.push({ type: "text", text: "" })
                     }
-                    fullText += ev.delta.text ?? ""
-                  } else if (ev.delta?.type === "input_json_delta" && currentToolBlock) {
-                    currentToolBlock.jsonAccum += ev.delta.partial_json ?? ""
+                  } else if (ev.type === "content_block_delta") {
+                    if (ev.delta?.type === "text_delta") {
+                      const lastText = contentBlocks[contentBlocks.length - 1]
+                      if (lastText?.type === "text") {
+                        lastText.text += ev.delta.text ?? ""
+                      } else {
+                        contentBlocks.push({ type: "text", text: ev.delta.text ?? "" })
+                      }
+                      fullText += ev.delta.text ?? ""
+                    } else if (ev.delta?.type === "input_json_delta" && currentToolBlock) {
+                      currentToolBlock.jsonAccum += ev.delta.partial_json ?? ""
+                    }
+                  } else if (ev.type === "content_block_stop") {
+                    if (currentToolBlock) {
+                      let input: any = {}
+                      try { input = JSON.parse(currentToolBlock.jsonAccum) } catch {}
+                      contentBlocks.push({ type: "tool_use", id: currentToolBlock.id, name: currentToolBlock.name, input })
+                      currentToolBlock = null
+                    }
+                  } else if (ev.type === "message_delta") {
+                    if (ev.delta?.stop_reason) capturedStopReason = ev.delta.stop_reason
+                    if (ev.usage?.output_tokens) sdkOutputTokens = ev.usage.output_tokens
+                    // Abort after all content blocks are complete
+                    if (contentBlocks.some((b: any) => b.type === "tool_use") && !fallbackAbort.signal.aborted) {
+                      logInfo("sdk.abort_after_complete_response_fallback", { reqId, contentBlockCount: contentBlocks.length, stopReason: capturedStopReason })
+                      fallbackAbort.abort()
+                    }
+                  } else if (ev.type === "message_start" && ev.message?.usage) {
+                    if (ev.message.usage.input_tokens) sdkInputTokens = ev.message.usage.input_tokens
+                    if (ev.message.usage.cache_read_input_tokens) sdkCacheReadTokens = ev.message.usage.cache_read_input_tokens
+                    if (ev.message.usage.cache_creation_input_tokens) sdkCacheCreationTokens = ev.message.usage.cache_creation_input_tokens
                   }
-                } else if (ev.type === "content_block_stop") {
-                  if (currentToolBlock) {
-                    let input: any = {}
-                    try { input = JSON.parse(currentToolBlock.jsonAccum) } catch {}
-                    contentBlocks.push({ type: "tool_use", id: currentToolBlock.id, name: currentToolBlock.name, input })
-                    currentToolBlock = null
+                } else if (!hasTools && message.type === "assistant") {
+                  let turnText = ""
+                  for (const block of message.message.content) {
+                    if (block.type === "text") turnText += block.text
                   }
-                } else if (ev.type === "message_delta") {
-                  if (ev.delta?.stop_reason) capturedStopReason = ev.delta.stop_reason
-                  if (ev.usage?.output_tokens) sdkOutputTokens = ev.usage.output_tokens
-                } else if (ev.type === "message_start" && ev.message?.usage) {
-                  if (ev.message.usage.input_tokens) sdkInputTokens = ev.message.usage.input_tokens
-                  if (ev.message.usage.cache_read_input_tokens) sdkCacheReadTokens = ev.message.usage.cache_read_input_tokens
-                  if (ev.message.usage.cache_creation_input_tokens) sdkCacheCreationTokens = ev.message.usage.cache_creation_input_tokens
+                  fullText = turnText
+                  const msgUsage = (message as any).message?.usage
+                  if (msgUsage?.input_tokens) sdkInputTokens = msgUsage.input_tokens
+                  if (msgUsage?.output_tokens) sdkOutputTokens = msgUsage.output_tokens
                 }
-              } else if (!hasTools && message.type === "assistant") {
-                let turnText = ""
-                for (const block of message.message.content) {
-                  if (block.type === "text") turnText += block.text
-                }
-                fullText = turnText
-                const msgUsage = (message as any).message?.usage
-                if (msgUsage?.input_tokens) sdkInputTokens = msgUsage.input_tokens
-                if (msgUsage?.output_tokens) sdkOutputTokens = msgUsage.output_tokens
               }
-            }
-            traceStore.phase(reqId, "sdk_done")
-            if (conversationId && capturedSessionId) {
-              sessionStore.set(conversationId!, capturedSessionId, model, messages.length)
-              logInfo("session.created_after_fallback", { reqId, conversationId, sdkSessionId: capturedSessionId })
+              traceStore.phase(reqId, "sdk_done")
+              logInfo("request.content_summary", {
+                reqId, hasTools,
+                contentBlockCount: contentBlocks.length,
+                contentBlockTypes: contentBlocks.map((b: any) => b.type),
+                toolNames: contentBlocks.filter((b: any) => b.type === "tool_use").map((b: any) => b.name),
+                textLength: fullText.length,
+                stopReason: capturedStopReason,
+                sdkEventCount,
+              })
+              if (conversationId && capturedSessionId) {
+                sessionStore.set(conversationId!, capturedSessionId, model, messages.length)
+                logInfo("session.created_after_fallback", { reqId, conversationId, sdkSessionId: capturedSessionId })
+              }
+            } catch (fallbackErr) {
+              if (fallbackAbort.signal.aborted && contentBlocks.some((b: any) => b.type === "tool_use")) {
+                traceStore.phase(reqId, "sdk_done")
+                logInfo("sdk.aborted_after_tool_call_fallback_nonstream", { reqId, sdkEventCount, contentBlocks: contentBlocks.length })
+                logInfo("request.content_summary", {
+                  reqId, hasTools,
+                  contentBlockCount: contentBlocks.length,
+                  contentBlockTypes: contentBlocks.map((b: any) => b.type),
+                  toolNames: contentBlocks.filter((b: any) => b.type === "tool_use").map((b: any) => b.name),
+                  textLength: fullText.length,
+                  stopReason: capturedStopReason,
+                  sdkEventCount,
+                })
+                if (conversationId && capturedSessionId) {
+                  sessionStore.set(conversationId!, capturedSessionId, model, messages.length)
+                }
+              } else {
+                throw fallbackErr
+              }
             }
           } else {
             throw resumeErr
@@ -1153,7 +1278,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               // Helper to forward a stream event directly as SSE
               // Track whether the current SDK content block was emitted (thinking blocks are skipped)
               let currentBlockEmitted = false
+              let blockOpen = false
+              let sseEventCount = 0
               const forwardStreamEvent = (ev: any) => {
+                sseEventCount++
                 if (ev.type === "message_start" && ev.message?.usage) {
                   if (ev.message.usage.input_tokens) sdkInputTokens = ev.message.usage.input_tokens
                   if (ev.message.usage.cache_read_input_tokens) sdkCacheReadTokens = ev.message.usage.cache_read_input_tokens
@@ -1168,9 +1296,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   if (cb?.type === "tool_use") {
                     toolCallCount++
                     currentBlockEmitted = true
+                    blockOpen = true
                     sse("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "tool_use", id: cb.id, name: stripMcpPrefix(cb.name), input: {} } })
                   } else if (cb?.type === "text") {
                     currentBlockEmitted = true
+                    blockOpen = true
                     sse("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "text", text: "" } })
                   } else {
                     // Thinking or other block types — skip (don't emit SSE)
@@ -1191,15 +1321,19 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   if (!currentBlockEmitted) return // Skip stop for non-emitted blocks (thinking)
                   sse("content_block_stop", { type: "content_block_stop", index: blockIdx })
                   blockIdx++
+                  blockOpen = false
                 } else if (ev.type === "message_delta") {
                   if (ev.delta?.stop_reason) capturedStopReason = ev.delta.stop_reason
                   if (ev.usage?.output_tokens) sdkOutputTokens = ev.usage.output_tokens
                 }
               }
 
+              // Mutable ref so forwardStreamEvent + abort logic can use the active controller
+              let activeAbortController = abortController
+
               try {
                 traceStore.phase(reqId, "sdk_starting")
-                for await (const message of query({ prompt: promptInput, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking, resume: resumeSessionId, mcpServers, canUseTool }) })) {
+                for await (const message of query({ prompt: promptInput, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking, resume: resumeSessionId, mcpServers }) })) {
                   sdkEventCount++
                   lastEventAt = Date.now()
                   resetStallTimer()
@@ -1223,10 +1357,22 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                       traceStore.phase(reqId, "sdk_streaming")
                     }
                     forwardStreamEvent(ev)
+                    // Abort after all content blocks are complete (message_delta comes after all content_block_stop)
+                    if (capturedStopReason && toolCallCount > 0 && !activeAbortController.signal.aborted) {
+                      logInfo("sdk.abort_after_complete_stream", { reqId, toolCallCount, blockIdx, stopReason: capturedStopReason })
+                      activeAbortController.abort()
+                    }
                   }
                   traceStore.sdkEvent(reqId, sdkEventCount, message.type, subtype)
                 }
                 traceStore.phase(reqId, "sdk_done")
+                logInfo("request.content_summary", {
+                  reqId, hasTools: true,
+                  blockIdx, toolCallCount,
+                  textLength: fullText.length,
+                  stopReason: capturedStopReason,
+                  sdkEventCount,
+                })
 
                 // Store session mapping
                 if (conversationId && capturedSessionId) {
@@ -1237,8 +1383,25 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   }
                 }
               } catch (resumeErr) {
-                // Resume failed — start a fresh session (no history reconstruction)
-                if (isResuming && resumeSessionId) {
+                // Aborted SDK after message_delta (all blocks complete) — not an error
+                if (abortController.signal.aborted && toolCallCount > 0) {
+                  traceStore.phase(reqId, "sdk_done")
+                  logInfo("sdk.aborted_after_tool_call", { reqId, sdkEventCount, toolCallCount, outputLen: fullText.length })
+                  logInfo("request.content_summary", {
+                    reqId, hasTools: true,
+                    blockIdx, toolCallCount,
+                    textLength: fullText.length,
+                    stopReason: capturedStopReason,
+                    sdkEventCount,
+                  })
+                  if (conversationId && capturedSessionId) {
+                    if (isResuming) {
+                      sessionStore.recordResume(conversationId!, messages.length, isCompacted)
+                    } else {
+                      sessionStore.set(conversationId!, capturedSessionId, model, messages.length)
+                    }
+                  }
+                } else if (isResuming && resumeSessionId) {
                   logWarn("session.resume_failed_stream", {
                     reqId, conversationId, sdkSessionId: resumeSessionId,
                     error: resumeErr instanceof Error ? resumeErr.message : String(resumeErr),
@@ -1255,37 +1418,70 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   capturedStopReason = null
                   hasEmittedAnyBlock = false
                   sdkEventCount = 0
-                  for await (const message of query({ prompt: promptInput, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking, mcpServers, canUseTool }) })) {
-                    sdkEventCount++
-                    lastEventAt = Date.now()
-                    resetStallTimer()
-                    const subtype = (message as any).event?.type ?? (message as any).message?.type
-                    if (message.type === "system" && (message as any).subtype === "init") {
-                      capturedSessionId = (message as any).session_id
-                    }
-                    if (message.type === "result") {
-                      const r = message as any
-                      if (r.session_id) capturedSessionId = r.session_id
-                      if (r.usage) {
-                        sdkInputTokens = r.usage.input_tokens ?? sdkInputTokens
-                        sdkOutputTokens = r.usage.output_tokens ?? sdkOutputTokens
-                        sdkCacheReadTokens = r.usage.cache_read_input_tokens ?? sdkCacheReadTokens
-                        sdkCacheCreationTokens = r.usage.cache_creation_input_tokens ?? sdkCacheCreationTokens
+                  const fallbackAbort = new AbortController()
+                  activeAbortController = fallbackAbort
+                  try {
+                    for await (const message of query({ prompt: promptInput, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController: fallbackAbort, thinking, mcpServers }) })) {
+                      sdkEventCount++
+                      lastEventAt = Date.now()
+                      resetStallTimer()
+                      const subtype = (message as any).event?.type ?? (message as any).message?.type
+                      if (message.type === "system" && (message as any).subtype === "init") {
+                        capturedSessionId = (message as any).session_id
                       }
-                    }
-                    if (message.type === "stream_event") {
-                      const ev = (message as any).event as any
-                      if (!trace!.firstTokenAt && (ev.type === "content_block_delta" || ev.type === "content_block_start")) {
-                        traceStore.phase(reqId, "sdk_streaming")
+                      if (message.type === "result") {
+                        const r = message as any
+                        if (r.session_id) capturedSessionId = r.session_id
+                        if (r.usage) {
+                          sdkInputTokens = r.usage.input_tokens ?? sdkInputTokens
+                          sdkOutputTokens = r.usage.output_tokens ?? sdkOutputTokens
+                          sdkCacheReadTokens = r.usage.cache_read_input_tokens ?? sdkCacheReadTokens
+                          sdkCacheCreationTokens = r.usage.cache_creation_input_tokens ?? sdkCacheCreationTokens
+                        }
                       }
-                      forwardStreamEvent(ev)
+                      if (message.type === "stream_event") {
+                        const ev = (message as any).event as any
+                        if (!trace!.firstTokenAt && (ev.type === "content_block_delta" || ev.type === "content_block_start")) {
+                          traceStore.phase(reqId, "sdk_streaming")
+                        }
+                        forwardStreamEvent(ev)
+                        // Abort after all content blocks are complete
+                        if (capturedStopReason && toolCallCount > 0 && !activeAbortController.signal.aborted) {
+                          logInfo("sdk.abort_after_complete_stream_fallback", { reqId, toolCallCount, blockIdx, stopReason: capturedStopReason })
+                          activeAbortController.abort()
+                        }
+                      }
+                      traceStore.sdkEvent(reqId, sdkEventCount, message.type, subtype)
                     }
-                    traceStore.sdkEvent(reqId, sdkEventCount, message.type, subtype)
-                  }
-                  traceStore.phase(reqId, "sdk_done")
-                  if (conversationId && capturedSessionId) {
-                    sessionStore.set(conversationId!, capturedSessionId, model, messages.length)
-                    logInfo("session.created_after_fallback_stream", { reqId, conversationId, sdkSessionId: capturedSessionId })
+                    traceStore.phase(reqId, "sdk_done")
+                    logInfo("request.content_summary", {
+                      reqId, hasTools: true,
+                      blockIdx, toolCallCount,
+                      textLength: fullText.length,
+                      stopReason: capturedStopReason,
+                      sdkEventCount,
+                    })
+                    if (conversationId && capturedSessionId) {
+                      sessionStore.set(conversationId!, capturedSessionId, model, messages.length)
+                      logInfo("session.created_after_fallback_stream", { reqId, conversationId, sdkSessionId: capturedSessionId })
+                    }
+                  } catch (fallbackErr) {
+                    if (fallbackAbort.signal.aborted && toolCallCount > 0) {
+                      traceStore.phase(reqId, "sdk_done")
+                      logInfo("sdk.aborted_after_tool_call_fallback_stream", { reqId, sdkEventCount, toolCallCount, outputLen: fullText.length })
+                      logInfo("request.content_summary", {
+                        reqId, hasTools: true,
+                        blockIdx, toolCallCount,
+                        textLength: fullText.length,
+                        stopReason: capturedStopReason,
+                        sdkEventCount,
+                      })
+                      if (conversationId && capturedSessionId) {
+                        sessionStore.set(conversationId!, capturedSessionId, model, messages.length)
+                      }
+                    } else {
+                      throw fallbackErr
+                    }
                   }
                 } else {
                   throw resumeErr
@@ -1309,9 +1505,18 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 sse("content_block_stop", { type: "content_block_stop", index: 0 })
               }
 
+              // Close any block left open by abort/interrupt truncating the stream
+              if (blockOpen) {
+                logWarn("stream.closing_orphaned_block", { reqId, blockIdx })
+                sse("content_block_stop", { type: "content_block_stop", index: blockIdx })
+                blockIdx++
+                blockOpen = false
+              }
+
               const stopReason = toolCallCount > 0 ? "tool_use" : (capturedStopReason ?? "end_turn")
               sse("message_delta", { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: sdkOutputTokens } })
               sse("message_stop", { type: "message_stop" })
+              logInfo("sse.summary", { reqId, sseEventCount, blockIdx, toolCallCount })
               controller.close()
 
               traceStore.setUsage(reqId, { input_tokens: sdkInputTokens, output_tokens: sdkOutputTokens, ...(sdkCacheReadTokens > 0 ? { cache_read_input_tokens: sdkCacheReadTokens } : {}), ...(sdkCacheCreationTokens > 0 ? { cache_creation_input_tokens: sdkCacheCreationTokens } : {}) })
