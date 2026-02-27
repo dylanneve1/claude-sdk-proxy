@@ -116,6 +116,20 @@ export function dumpError(reqId: string, data: Record<string, unknown>): string 
   return path
 }
 
+/** Write a session context dump (reset/compaction). Returns the file path. */
+export function dumpSessionContext(reqId: string, data: Record<string, unknown>): string {
+  const dir = join(LOG_DIR, "sessions")
+  const path = join(dir, `${reqId}.json`)
+  try {
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+    const content = JSON.stringify({ ts: new Date().toISOString(), reqId, ...data }, null, 2)
+    appendFileSync(path, content)
+  } catch (e) {
+    logError("logger.session_dump_failed", { reqId, path, error: String(e) })
+  }
+  return path
+}
+
 // ── Legacy API (backward-compatible) ─────────────────────────────────────────
 // These are used by existing code. They map to the new structured logging.
 

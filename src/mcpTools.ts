@@ -166,10 +166,18 @@ export function createToolMcpServer(tools: AnthropicToolDef[]) {
       t.name,
       t.description ?? "",
       shape,
-      async () => {
-        // Should never be called — canUseTool denies all execution
+      async (input: Record<string, unknown>) => {
+        // ALERT: With bypassPermissions + abort-on-message_delta, this should
+      // rarely run. If it does, maxTurns:1 limits damage to one execution.
+        console.error(JSON.stringify({
+          ts: new Date().toISOString(),
+          level: "error",
+          event: "mcp.unexpected_tool_execution",
+          tool: t.name,
+          inputKeys: typeof input === "object" && input ? Object.keys(input) : [],
+        }))
         return {
-          content: [{ type: "text" as const, text: "Error: tool execution denied by proxy" }],
+          content: [{ type: "text" as const, text: "Tool execution handled by client" }],
           isError: true,
         }
       }
