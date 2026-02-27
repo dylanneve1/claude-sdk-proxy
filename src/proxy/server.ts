@@ -679,17 +679,20 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         if (stored) {
           const countDelta = messages.length - stored.messageCount
 
-          if (countDelta < 0 && messages.length <= 2) {
-            // Likely a /reset — invalidate stale SDK session, start fresh
-            logInfo("session.likely_reset", {
-              reqId, conversationId, model,
-              sdkSessionId: stored.sdkSessionId,
-              storedMsgCount: stored.messageCount,
-              currentMsgCount: messages.length,
-            })
-            sessionStore.invalidate(conversationId)
-          } else {
-            if (countDelta < 0) {
+          if (countDelta < 0) {
+            // Message count dropped — either compaction or reset.
+            // In both cases, invalidate the SDK session so the fresh
+            // (compacted) context actually reduces token usage.
+            // The SDK session caches all old turns; resuming it would
+            // defeat compaction entirely.
+            if (messages.length <= 2) {
+              logInfo("session.likely_reset", {
+                reqId, conversationId, model,
+                sdkSessionId: stored.sdkSessionId,
+                storedMsgCount: stored.messageCount,
+                currentMsgCount: messages.length,
+              })
+            } else {
               isCompacted = true
               logInfo("session.compaction_detected", {
                 reqId, conversationId, model,
@@ -699,7 +702,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 dropped: -countDelta,
               })
             }
-
+            sessionStore.invalidate(conversationId)
+          } else {
             resumeSessionId = stored.sdkSessionId
             isResuming = true
             logInfo("session.resuming", {
